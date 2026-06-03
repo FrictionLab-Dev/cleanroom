@@ -4,7 +4,7 @@ Cleanroom is the Friction Lab tool for safe developer-cache cleanup.
 
 The preferred public command is `clean`.
 
-Cleanroom uses bundled cleanup profiles to describe known artifacts, categories, safety levels, and recommendations. Profiles describe, core performs:
+Cleanroom uses bundled cleanup profiles to describe known artifacts, categories, safety levels, and recommendations. Profiles are descriptive:
 
 - Profiles explain what an artifact is
 - Profiles explain why it may be safe or unsafe to clean
