@@ -150,6 +150,7 @@ mod tests {
                             stale_bucket: StaleBucket::Fresh,
                         },
                         keep: true,
+                        generated_selection: false,
                         metadata: CleanEntryMetadata {
                             matched_rule: None,
                             description: "Unknown generated artifact.".to_string(),
@@ -176,6 +177,7 @@ mod tests {
                             stale_bucket: StaleBucket::Recent,
                         },
                         keep: false,
+                        generated_selection: false,
                         metadata: CleanEntryMetadata {
                             matched_rule: Some("ModuleCache.noindex".to_string()),
                             description: "Known rebuildable cache.".to_string(),

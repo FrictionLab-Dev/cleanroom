@@ -119,6 +119,10 @@ fn handle_action_mode(app: &mut App, key: KeyEvent) -> bool {
         Screen::CategorySummary => match key.code {
             KeyCode::Char('c') => app.show_preview(),
             KeyCode::Char('r') => app.rescan_xcode(),
+            KeyCode::Char('v') => app.select_very_stale_safe_entries(),
+            KeyCode::Char('3') => app.select_safe_entries_older_than_days(30),
+            KeyCode::Char('9') => app.select_safe_entries_older_than_days(90),
+            KeyCode::Char('u') => app.clear_generated_selections(),
             KeyCode::Esc | KeyCode::Tab => app.cancel_action_mode(),
             KeyCode::Char('q') => return true,
             _ => {}
@@ -127,6 +131,10 @@ fn handle_action_mode(app: &mut App, key: KeyEvent) -> bool {
             KeyCode::Char('a') => app.mark_all_selected_category(true),
             KeyCode::Char('r') => app.mark_all_selected_category(false),
             KeyCode::Char('c') => app.show_preview(),
+            KeyCode::Char('v') => app.select_very_stale_safe_entries(),
+            KeyCode::Char('3') => app.select_safe_entries_older_than_days(30),
+            KeyCode::Char('9') => app.select_safe_entries_older_than_days(90),
+            KeyCode::Char('u') => app.clear_generated_selections(),
             KeyCode::Esc | KeyCode::Tab => app.cancel_action_mode(),
             KeyCode::Char('q') => return true,
             _ => {}

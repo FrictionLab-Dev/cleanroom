@@ -933,6 +933,7 @@ fn clean_entry_from_path(
         file_count: metrics.file_count,
         age: entry_age_from_metrics(&metrics, now),
         keep: !category_metadata.default_cleanup,
+        generated_selection: false,
         metadata: entry_metadata(&name, profile, category_metadata),
     })
 }
@@ -1211,6 +1212,7 @@ mod tests {
             file_count: 1,
             age,
             keep: false,
+            generated_selection: false,
             metadata: CleanEntryMetadata {
                 matched_rule: None,
                 description: "Generated artifact.".to_string(),

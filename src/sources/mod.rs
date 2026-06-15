@@ -40,6 +40,7 @@ pub struct CleanEntry {
     pub file_count: u64,
     pub age: EntryAge,
     pub keep: bool,
+    pub generated_selection: bool,
     pub metadata: CleanEntryMetadata,
 }
 
@@ -98,6 +99,28 @@ impl CleanCategory {
             .sum()
     }
 
+    pub fn reclaimable_stale_size_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                !entry.keep
+                    && matches!(
+                        entry.age.stale_bucket,
+                        StaleBucket::Stale | StaleBucket::VeryStale
+                    )
+            })
+            .map(|entry| entry.size_bytes)
+            .sum()
+    }
+
+    pub fn reclaimable_very_stale_size_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.keep && entry.age.stale_bucket == StaleBucket::VeryStale)
+            .map(|entry| entry.size_bytes)
+            .sum()
+    }
+
     pub fn keep_count(&self) -> usize {
         self.entries.iter().filter(|entry| entry.keep).count()
     }
@@ -131,6 +154,39 @@ impl CleanCategory {
             .iter()
             .filter(|entry| entry.age.stale_bucket == StaleBucket::VeryStale)
             .count()
+    }
+
+    pub fn reclaimable_stale_entry_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                !entry.keep
+                    && matches!(
+                        entry.age.stale_bucket,
+                        StaleBucket::Stale | StaleBucket::VeryStale
+                    )
+            })
+            .count()
+    }
+
+    pub fn reclaimable_very_stale_entry_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.keep && entry.age.stale_bucket == StaleBucket::VeryStale)
+            .count()
+    }
+
+    pub fn generated_selection_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.keep && entry.generated_selection)
+            .count()
+    }
+
+    pub fn allows_bulk_age_selection(&self) -> bool {
+        self.metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.safety != CategorySafetyLevel::HighCaution)
     }
 }
 

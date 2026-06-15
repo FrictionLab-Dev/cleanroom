@@ -53,6 +53,12 @@ pub struct HighCautionConfirmationState {
     pub typed: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BulkSelectionScope {
+    AllEligibleCategories,
+    SelectedCategoryOnly,
+}
+
 impl App {
     pub fn new() -> Self {
         Self {
@@ -217,6 +223,7 @@ impl App {
             .and_then(|category| category.entries.get_mut(selected))
         {
             entry.keep = !entry.keep;
+            entry.generated_selection = false;
         }
     }
 
@@ -224,8 +231,64 @@ impl App {
         if let Some(category) = self.selected_category_mut() {
             for entry in &mut category.entries {
                 entry.keep = keep;
+                entry.generated_selection = false;
             }
         }
+    }
+
+    pub fn select_very_stale_safe_entries(&mut self) {
+        self.apply_safe_bulk_selection(
+            |entry| entry.age.stale_bucket == crate::sources::StaleBucket::VeryStale,
+            "very stale",
+        );
+    }
+
+    pub fn select_safe_entries_older_than_days(&mut self, days: u64) {
+        let threshold_seconds = days.saturating_mul(24 * 60 * 60);
+        self.apply_safe_bulk_selection(
+            move |entry| {
+                entry
+                    .age
+                    .age_seconds
+                    .is_some_and(|age_seconds| age_seconds >= threshold_seconds)
+            },
+            &format!("older than {days} days"),
+        );
+    }
+
+    pub fn clear_generated_selections(&mut self) {
+        let scope = self.bulk_selection_scope();
+        let selected_category_index = self.category_selected;
+        let mut cleared = 0_usize;
+
+        let Some(scan) = self.xcode_scan.as_mut() else {
+            self.warning = Some("No Xcode scan is loaded yet.".to_string());
+            return;
+        };
+
+        for (index, category) in scan.categories.iter_mut().enumerate() {
+            if matches!(scope, BulkSelectionScope::SelectedCategoryOnly)
+                && index != selected_category_index
+            {
+                continue;
+            }
+
+            for entry in &mut category.entries {
+                if entry.generated_selection {
+                    if !entry.keep {
+                        entry.keep = true;
+                        cleared += 1;
+                    }
+                    entry.generated_selection = false;
+                }
+            }
+        }
+
+        self.warning = if cleared == 0 {
+            Some("No generated bulk selections were active in this scope.".to_string())
+        } else {
+            None
+        };
     }
 
     pub fn enter_action_mode(&mut self) {
@@ -348,8 +411,8 @@ impl App {
 
     pub fn category_table_header(&self) -> String {
         format!(
-            "{:<18} {:>9} {:>9} {:>7}  {:<16}",
-            "Category", "Total", "Selected", "Files", "Safety"
+            "{:<18} {:>9} {:>9} {:>9} {:>7}  {:<16}",
+            "Category", "Total", "Selected", "Stale", "Files", "Safety"
         )
     }
 
@@ -361,10 +424,15 @@ impl App {
                     .iter()
                     .map(|category| {
                         format!(
-                            "{:<18} {:>9} {:>9} {:>7}  {:<16}",
+                            "{:<18} {:>9} {:>9} {:>9} {:>7}  {:<16}",
                             truncate_text(&category.name, 18),
                             format_bytes(category.total_size_bytes),
                             format_bytes(category.reclaimable_size_bytes()),
+                            format!(
+                                "{}/{}",
+                                category.stale_entry_count(),
+                                category.very_stale_entry_count()
+                            ),
                             category.total_file_count,
                             category
                                 .metadata
@@ -426,6 +494,13 @@ impl App {
                 plan.removal_count,
                 self.total_reclaimable_file_count()
             ),
+            format!(
+                "Selected stale: {} ({}) | Very stale: {} ({})",
+                self.total_reclaimable_stale_entry_count(),
+                format_bytes(self.total_reclaimable_stale_bytes()),
+                self.total_reclaimable_very_stale_entry_count(),
+                format_bytes(self.total_reclaimable_very_stale_bytes())
+            ),
             String::new(),
         ];
 
@@ -456,6 +531,16 @@ impl App {
             ),
             format!("Cleanup candidates: {}", plan.removal_count),
             format!("Selected files: {}", self.total_reclaimable_file_count()),
+            format!(
+                "Selected stale: {} ({})",
+                self.total_reclaimable_stale_entry_count(),
+                format_bytes(self.total_reclaimable_stale_bytes())
+            ),
+            format!(
+                "Selected very stale: {} ({})",
+                self.total_reclaimable_very_stale_entry_count(),
+                format_bytes(self.total_reclaimable_very_stale_bytes())
+            ),
             "These items will be moved to Trash, not permanently deleted.".to_string(),
             if plan.requires_high_caution_confirmation() {
                 "High-caution typed confirmation was required before this final step.".to_string()
@@ -552,16 +637,17 @@ impl App {
                 "↑↓ move · Enter open category · Tab actions · Esc back · q quit",
                 "",
             ],
-            (Screen::CategorySummary, InteractionMode::Action) => {
-                ["action mode · c preview · r rescan · Esc cancel", ""]
-            }
+            (Screen::CategorySummary, InteractionMode::Action) => [
+                "action mode · v very stale safe · 3 >30d safe · 9 >90d safe · c preview",
+                "u clear bulk selections · r rescan · Esc cancel",
+            ],
             (Screen::EntryChecklist, InteractionMode::Normal) => [
                 "↑↓ move · Space toggle · Tab actions · Esc back · q quit",
                 "",
             ],
             (Screen::EntryChecklist, InteractionMode::Action) => [
-                "action mode · a keep all · r remove all · c preview · Esc cancel",
-                "",
+                "action mode · a keep all · r remove all · v very stale here · 3 >30d here",
+                "9 >90d here · u clear bulk here · c preview · Esc cancel",
             ],
             (Screen::PreviewCleanup, InteractionMode::Normal) => {
                 ["Tab actions · Esc back · q quit", ""]
@@ -620,6 +706,20 @@ impl App {
                     ),
                     format!("Cleanup candidates: {}", plan.removal_count),
                     format!("Selected files: {}", self.total_reclaimable_file_count()),
+                    format!(
+                        "Selected stale: {} ({})",
+                        self.total_reclaimable_stale_entry_count(),
+                        format_bytes(self.total_reclaimable_stale_bytes())
+                    ),
+                    format!(
+                        "Selected very stale: {} ({})",
+                        self.total_reclaimable_very_stale_entry_count(),
+                        format_bytes(self.total_reclaimable_very_stale_bytes())
+                    ),
+                    format!(
+                        "Bulk-selected entries: {}",
+                        self.total_generated_selection_count()
+                    ),
                     "These items will be moved to Trash, not permanently deleted.".to_string(),
                 ];
                 lines.extend(self.preview_policy_lines());
@@ -635,6 +735,20 @@ impl App {
                     ),
                     format!("Cleanup candidates: {}", plan.removal_count),
                     format!("Selected files: {}", self.total_reclaimable_file_count()),
+                    format!(
+                        "Selected stale: {} ({})",
+                        self.total_reclaimable_stale_entry_count(),
+                        format_bytes(self.total_reclaimable_stale_bytes())
+                    ),
+                    format!(
+                        "Selected very stale: {} ({})",
+                        self.total_reclaimable_very_stale_entry_count(),
+                        format_bytes(self.total_reclaimable_very_stale_bytes())
+                    ),
+                    format!(
+                        "Bulk-selected entries: {}",
+                        self.total_generated_selection_count()
+                    ),
                     "These items will be moved to Trash, not permanently deleted.".to_string(),
                 ];
                 lines.extend(self.preview_policy_lines());
@@ -727,6 +841,66 @@ impl App {
                 scan.categories
                     .iter()
                     .map(CleanCategory::reclaimable_file_count)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn total_reclaimable_stale_bytes(&self) -> u64 {
+        self.xcode_scan
+            .as_ref()
+            .map(|scan| {
+                scan.categories
+                    .iter()
+                    .map(CleanCategory::reclaimable_stale_size_bytes)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn total_reclaimable_very_stale_bytes(&self) -> u64 {
+        self.xcode_scan
+            .as_ref()
+            .map(|scan| {
+                scan.categories
+                    .iter()
+                    .map(CleanCategory::reclaimable_very_stale_size_bytes)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn total_reclaimable_stale_entry_count(&self) -> usize {
+        self.xcode_scan
+            .as_ref()
+            .map(|scan| {
+                scan.categories
+                    .iter()
+                    .map(CleanCategory::reclaimable_stale_entry_count)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn total_reclaimable_very_stale_entry_count(&self) -> usize {
+        self.xcode_scan
+            .as_ref()
+            .map(|scan| {
+                scan.categories
+                    .iter()
+                    .map(CleanCategory::reclaimable_very_stale_entry_count)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn total_generated_selection_count(&self) -> usize {
+        self.xcode_scan
+            .as_ref()
+            .map(|scan| {
+                scan.categories
+                    .iter()
+                    .map(CleanCategory::generated_selection_count)
                     .sum()
             })
             .unwrap_or(0)
@@ -839,6 +1013,79 @@ impl App {
         )
     }
 
+    fn bulk_selection_scope(&self) -> BulkSelectionScope {
+        match self.screen {
+            Screen::EntryChecklist => BulkSelectionScope::SelectedCategoryOnly,
+            _ => BulkSelectionScope::AllEligibleCategories,
+        }
+    }
+
+    fn apply_safe_bulk_selection(
+        &mut self,
+        predicate: impl Fn(&crate::sources::CleanEntry) -> bool,
+        label: &str,
+    ) {
+        let scope = self.bulk_selection_scope();
+        let selected_category_index = self.category_selected;
+        let selected_category_name = self
+            .selected_category()
+            .map(|category| category.name.clone());
+
+        let Some(scan) = self.xcode_scan.as_mut() else {
+            self.warning = Some("No Xcode scan is loaded yet.".to_string());
+            return;
+        };
+
+        let mut matched_entries = 0_usize;
+        let mut newly_selected = 0_usize;
+        let mut skipped_high_caution = false;
+
+        for (index, category) in scan.categories.iter_mut().enumerate() {
+            if matches!(scope, BulkSelectionScope::SelectedCategoryOnly)
+                && index != selected_category_index
+            {
+                continue;
+            }
+
+            if !category.allows_bulk_age_selection() {
+                skipped_high_caution = true;
+                continue;
+            }
+
+            for entry in &mut category.entries {
+                if !predicate(entry) {
+                    continue;
+                }
+
+                matched_entries += 1;
+                if entry.keep {
+                    entry.keep = false;
+                    entry.generated_selection = true;
+                    newly_selected += 1;
+                }
+            }
+        }
+
+        self.warning = if matched_entries == 0 {
+            if skipped_high_caution && matches!(scope, BulkSelectionScope::SelectedCategoryOnly) {
+                Some(format!(
+                    "{} is a high-caution category. Bulk age actions skip Archives and Device Support by default.",
+                    selected_category_name.unwrap_or_else(|| "This category".to_string())
+                ))
+            } else {
+                Some(format!(
+                    "No safe Xcode entries matched the {label} filter in this scope."
+                ))
+            }
+        } else if newly_selected == 0 {
+            Some(format!(
+                "Matching safe entries were already selected for cleanup ({label})."
+            ))
+        } else {
+            None
+        };
+    }
+
     fn source_detail_lines(&self) -> Vec<String> {
         match self.selected_source() {
             Some(source) if source.id == CleanSourceId::Xcode => vec![
@@ -897,6 +1144,20 @@ impl App {
                         "Stale entries: {} stale / {} very stale",
                         category.stale_entry_count(),
                         category.very_stale_entry_count()
+                    ),
+                    format!(
+                        "Selected stale: {} ({})",
+                        category.reclaimable_stale_entry_count(),
+                        format_bytes(category.reclaimable_stale_size_bytes())
+                    ),
+                    format!(
+                        "Selected very stale: {} ({})",
+                        category.reclaimable_very_stale_entry_count(),
+                        format_bytes(category.reclaimable_very_stale_size_bytes())
+                    ),
+                    format!(
+                        "Bulk-selected entries: {}",
+                        category.generated_selection_count()
                     ),
                 ];
 
@@ -1003,6 +1264,8 @@ impl App {
             "Selection: {}",
             if entry.keep {
                 "keep"
+            } else if entry.generated_selection {
+                "cleanup candidate (bulk-selected)"
             } else {
                 "cleanup candidate"
             }
@@ -1189,21 +1452,55 @@ mod tests {
 
     use super::{App, Screen};
 
+    fn stale_bucket_for_age(age_seconds: Option<u64>) -> StaleBucket {
+        const DAY: u64 = 24 * 60 * 60;
+        match age_seconds {
+            Some(seconds) if seconds < 2 * DAY => StaleBucket::Fresh,
+            Some(seconds) if seconds < 14 * DAY => StaleBucket::Recent,
+            Some(seconds) if seconds < 90 * DAY => StaleBucket::Stale,
+            Some(_) => StaleBucket::VeryStale,
+            None => StaleBucket::Unknown,
+        }
+    }
+
+    fn age_label(age_seconds: Option<u64>) -> String {
+        const DAY: u64 = 24 * 60 * 60;
+        match age_seconds {
+            None => "Unknown".to_string(),
+            Some(seconds) if seconds < DAY => "Today".to_string(),
+            Some(seconds) => format!("{} days", seconds / DAY),
+        }
+    }
+
     fn make_entry(name: &str, keep: bool) -> CleanEntry {
+        make_entry_with_age_and_size(name, keep, Some(60 * 60), 10)
+    }
+
+    fn make_entry_with_age_and_size(
+        name: &str,
+        keep: bool,
+        age_seconds: Option<u64>,
+        size_bytes: u64,
+    ) -> CleanEntry {
         CleanEntry {
             name: name.to_string(),
             path: PathBuf::from(format!("/tmp/{name}")),
             allowed_root: PathBuf::from("/tmp"),
-            size_bytes: 10,
+            size_bytes,
             file_count: 1,
             age: EntryAge {
-                last_modified_unix_seconds: Some(1),
-                last_modified_label: "1970-01-01".to_string(),
-                age_seconds: Some(60 * 60),
-                age_label: "Today".to_string(),
-                stale_bucket: StaleBucket::Fresh,
+                last_modified_unix_seconds: age_seconds.map(|seconds| 1 + seconds),
+                last_modified_label: if age_seconds.is_some() {
+                    "1970-01-01".to_string()
+                } else {
+                    "Unknown".to_string()
+                },
+                age_seconds,
+                age_label: age_label(age_seconds),
+                stale_bucket: stale_bucket_for_age(age_seconds),
             },
             keep,
+            generated_selection: false,
             metadata: CleanEntryMetadata {
                 matched_rule: None,
                 description: "Generated artifact.".to_string(),
@@ -1214,14 +1511,17 @@ mod tests {
         }
     }
 
-    fn make_category(
+    fn make_category_with_entries(
         id: CleanCategoryId,
         name: &str,
         safety: CategorySafetyLevel,
         cleanup_kind: CleanupRecommendationKind,
         default_cleanup: bool,
-        keep: bool,
+        entries: Vec<CleanEntry>,
     ) -> CleanCategory {
+        let total_size_bytes = entries.iter().map(|entry| entry.size_bytes).sum();
+        let total_file_count = entries.iter().map(|entry| entry.file_count).sum();
+
         CleanCategory {
             id,
             name: name.to_string(),
@@ -1231,9 +1531,9 @@ mod tests {
             exists: true,
             note: None,
             warnings: Vec::new(),
-            entries: vec![make_entry(name, keep)],
-            total_size_bytes: 10,
-            total_file_count: 1,
+            entries,
+            total_size_bytes,
+            total_file_count,
             metadata: Some(CleanCategoryMetadata {
                 description: "Category".to_string(),
                 safety,
@@ -1246,6 +1546,24 @@ mod tests {
                 impact: "Impact".to_string(),
             }),
         }
+    }
+
+    fn make_category(
+        id: CleanCategoryId,
+        name: &str,
+        safety: CategorySafetyLevel,
+        cleanup_kind: CleanupRecommendationKind,
+        default_cleanup: bool,
+        keep: bool,
+    ) -> CleanCategory {
+        make_category_with_entries(
+            id,
+            name,
+            safety,
+            cleanup_kind,
+            default_cleanup,
+            vec![make_entry(name, keep)],
+        )
     }
 
     fn app_with_scan(categories: Vec<CleanCategory>) -> App {
@@ -1362,5 +1680,266 @@ mod tests {
 
         assert_eq!(app.screen, Screen::HighCautionConfirmation);
         assert!(app.warning.is_some());
+    }
+
+    #[test]
+    fn bulk_select_very_stale_only_marks_safe_entries() {
+        let derived_entries = vec![
+            make_entry_with_age_and_size("fresh", true, Some(60 * 60), 10),
+            make_entry_with_age_and_size("very-stale", true, Some(120 * 24 * 60 * 60), 50),
+        ];
+        let archive_entries = vec![make_entry_with_age_and_size(
+            "archive",
+            true,
+            Some(120 * 24 * 60 * 60),
+            80,
+        )];
+        let mut app = app_with_scan(vec![
+            make_category_with_entries(
+                CleanCategoryId::DerivedData,
+                "Derived Data",
+                CategorySafetyLevel::HighConfidence,
+                CleanupRecommendationKind::SafeCleanupCandidate,
+                true,
+                derived_entries,
+            ),
+            make_category_with_entries(
+                CleanCategoryId::Archives,
+                "Archives",
+                CategorySafetyLevel::HighCaution,
+                CleanupRecommendationKind::KeepByDefault,
+                false,
+                archive_entries,
+            ),
+        ]);
+
+        app.screen = Screen::CategorySummary;
+        app.select_very_stale_safe_entries();
+
+        let scan = app.xcode_scan.as_ref().expect("scan should exist");
+        assert!(scan.categories[0].entries[0].keep);
+        assert!(!scan.categories[0].entries[1].keep);
+        assert!(scan.categories[0].entries[1].generated_selection);
+        assert!(scan.categories[1].entries[0].keep);
+        assert_eq!(app.total_reclaimable_bytes(), 50);
+    }
+
+    #[test]
+    fn bulk_select_very_stale_skips_device_support_by_default() {
+        let mut app = app_with_scan(vec![
+            make_category_with_entries(
+                CleanCategoryId::DerivedData,
+                "Derived Data",
+                CategorySafetyLevel::HighConfidence,
+                CleanupRecommendationKind::SafeCleanupCandidate,
+                true,
+                vec![make_entry_with_age_and_size(
+                    "derived",
+                    true,
+                    Some(120 * 24 * 60 * 60),
+                    40,
+                )],
+            ),
+            make_category_with_entries(
+                CleanCategoryId::DeviceSupport,
+                "Device Support",
+                CategorySafetyLevel::HighCaution,
+                CleanupRecommendationKind::KeepByDefault,
+                false,
+                vec![make_entry_with_age_and_size(
+                    "device-support",
+                    true,
+                    Some(120 * 24 * 60 * 60),
+                    60,
+                )],
+            ),
+        ]);
+
+        app.screen = Screen::CategorySummary;
+        app.select_very_stale_safe_entries();
+
+        let scan = app.xcode_scan.as_ref().expect("scan should exist");
+        assert!(!scan.categories[0].entries[0].keep);
+        assert!(scan.categories[1].entries[0].keep);
+    }
+
+    #[test]
+    fn bulk_select_older_than_30_days_respects_threshold() {
+        let entries = vec![
+            make_entry_with_age_and_size("fresh", true, Some(10 * 24 * 60 * 60), 10),
+            make_entry_with_age_and_size("recent", true, Some(40 * 24 * 60 * 60), 20),
+            make_entry_with_age_and_size("unknown", true, None, 30),
+        ];
+        let mut app = app_with_scan(vec![make_category_with_entries(
+            CleanCategoryId::DerivedData,
+            "Derived Data",
+            CategorySafetyLevel::HighConfidence,
+            CleanupRecommendationKind::SafeCleanupCandidate,
+            true,
+            entries,
+        )]);
+
+        app.screen = Screen::CategorySummary;
+        app.select_safe_entries_older_than_days(30);
+
+        let selected = &app
+            .xcode_scan
+            .as_ref()
+            .expect("scan should exist")
+            .categories[0]
+            .entries;
+        assert!(selected[0].keep);
+        assert!(!selected[1].keep);
+        assert!(selected[1].generated_selection);
+        assert!(selected[2].keep);
+    }
+
+    #[test]
+    fn bulk_select_older_than_90_days_respects_threshold() {
+        let entries = vec![
+            make_entry_with_age_and_size("stale", true, Some(45 * 24 * 60 * 60), 10),
+            make_entry_with_age_and_size("very-stale", true, Some(120 * 24 * 60 * 60), 20),
+        ];
+        let mut app = app_with_scan(vec![make_category_with_entries(
+            CleanCategoryId::DerivedData,
+            "Derived Data",
+            CategorySafetyLevel::HighConfidence,
+            CleanupRecommendationKind::SafeCleanupCandidate,
+            true,
+            entries,
+        )]);
+
+        app.screen = Screen::CategorySummary;
+        app.select_safe_entries_older_than_days(90);
+
+        let selected = &app
+            .xcode_scan
+            .as_ref()
+            .expect("scan should exist")
+            .categories[0]
+            .entries;
+        assert!(selected[0].keep);
+        assert!(!selected[1].keep);
+        assert!(selected[1].generated_selection);
+    }
+
+    #[test]
+    fn entry_checklist_bulk_actions_only_affect_current_category() {
+        let mut app = app_with_scan(vec![
+            make_category_with_entries(
+                CleanCategoryId::DerivedData,
+                "Derived Data",
+                CategorySafetyLevel::HighConfidence,
+                CleanupRecommendationKind::SafeCleanupCandidate,
+                true,
+                vec![make_entry_with_age_and_size(
+                    "derived",
+                    true,
+                    Some(120 * 24 * 60 * 60),
+                    10,
+                )],
+            ),
+            make_category_with_entries(
+                CleanCategoryId::Products,
+                "Products",
+                CategorySafetyLevel::MediumConfidence,
+                CleanupRecommendationKind::ReviewCarefully,
+                false,
+                vec![make_entry_with_age_and_size(
+                    "product",
+                    true,
+                    Some(120 * 24 * 60 * 60),
+                    20,
+                )],
+            ),
+        ]);
+
+        app.screen = Screen::EntryChecklist;
+        app.category_selected = 0;
+        app.select_very_stale_safe_entries();
+
+        let scan = app.xcode_scan.as_ref().expect("scan should exist");
+        assert!(!scan.categories[0].entries[0].keep);
+        assert!(scan.categories[1].entries[0].keep);
+    }
+
+    #[test]
+    fn clear_generated_selections_preserves_manual_choices() {
+        let mut manual =
+            make_entry_with_age_and_size("manual", false, Some(120 * 24 * 60 * 60), 20);
+        manual.generated_selection = false;
+        let generated =
+            make_entry_with_age_and_size("generated", false, Some(120 * 24 * 60 * 60), 30);
+        let mut generated = generated;
+        generated.generated_selection = true;
+
+        let mut app = app_with_scan(vec![make_category_with_entries(
+            CleanCategoryId::DerivedData,
+            "Derived Data",
+            CategorySafetyLevel::HighConfidence,
+            CleanupRecommendationKind::SafeCleanupCandidate,
+            true,
+            vec![manual, generated],
+        )]);
+
+        app.screen = Screen::CategorySummary;
+        app.clear_generated_selections();
+
+        let entries = &app
+            .xcode_scan
+            .as_ref()
+            .expect("scan should exist")
+            .categories[0]
+            .entries;
+        assert!(!entries[0].keep);
+        assert!(entries[1].keep);
+        assert_eq!(app.total_generated_selection_count(), 0);
+    }
+
+    #[test]
+    fn manual_high_caution_selection_still_requires_typed_confirmation() {
+        let mut app = app_with_scan(vec![make_category(
+            CleanCategoryId::DeviceSupport,
+            "Device Support",
+            CategorySafetyLevel::HighCaution,
+            CleanupRecommendationKind::KeepByDefault,
+            false,
+            true,
+        )]);
+        app.screen = Screen::EntryChecklist;
+        app.toggle_selected_entry();
+
+        app.show_confirmation();
+
+        assert_eq!(app.screen, Screen::HighCautionConfirmation);
+        assert_eq!(
+            app.high_caution_confirmation
+                .as_ref()
+                .map(|state| state.phrase.as_str()),
+            Some("CLEAN DEVICE SUPPORT")
+        );
+    }
+
+    #[test]
+    fn category_detail_summary_counts_stale_and_very_stale_entries() {
+        let mut app = app_with_scan(vec![make_category_with_entries(
+            CleanCategoryId::DerivedData,
+            "Derived Data",
+            CategorySafetyLevel::HighConfidence,
+            CleanupRecommendationKind::SafeCleanupCandidate,
+            true,
+            vec![
+                make_entry_with_age_and_size("fresh", true, Some(60 * 60), 10),
+                make_entry_with_age_and_size("stale", false, Some(30 * 24 * 60 * 60), 20),
+                make_entry_with_age_and_size("very-stale", false, Some(120 * 24 * 60 * 60), 30),
+            ],
+        )]);
+        app.screen = Screen::CategorySummary;
+
+        let lines = app.detail_panel_lines();
+
+        assert!(lines.contains(&"Stale entries: 2 stale / 1 very stale".to_string()));
+        assert!(lines.contains(&"Selected stale: 2 (50 B)".to_string()));
+        assert!(lines.contains(&"Selected very stale: 1 (30 B)".to_string()));
     }
 }

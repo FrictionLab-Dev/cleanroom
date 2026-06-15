@@ -97,6 +97,7 @@ Current behavior:
 - High-confidence categories such as `Derived Data`, `SwiftUI Previews`, `Documentation Cache`, `Test Logs`, and `Result Bundles` can be pre-marked as cleanup candidates
 - `Archives` and `Device Support` stay keep-by-default and high-caution
 - Entry review is stale-first and size-aware so older and heavier artifacts surface first
+- Age-aware bulk review helpers can safely select `very stale`, `>30 day`, or `>90 day` entries before cleanup
 - Entry details include age labels and last-modified date labels when metadata is available
 - Users can still review each category and choose what to keep
 - Cleanup requires explicit confirmation
@@ -131,14 +132,23 @@ Safety notes:
 - `/private/tmp` scanning stays tightly bounded to clearly Xcode-related patterns
 - Archives and Device Support are not default cleanup targets in this pass
 - Archives and Device Support still require an extra typed confirmation even if you manually mark them for cleanup
+- Bulk age actions skip `Archives` and `Device Support` by default
 - Cleanup profiles are descriptive only and cannot execute cleanup actions
 - Cleanup logs are written to `~/Library/Logs/Friction Lab/Cleanroom/cleanroom.log`
 
 Review behavior:
 - Categories keep a scan-first posture: totals, selected size, file count, safety, and stale signals are shown before cleanup
 - Entry ordering favors very stale items first, then stale items, then size, then stable alphabetical order
+- Category details and preview summaries include stale counts, very stale counts, and stale selected size
 - Preview ordering also surfaces high-caution selections first so risky cleanup plans are obvious
 - Missing modified-time metadata falls back to `Unknown` without blocking scanning or cleanup preview
+- Bulk-generated selections can be cleared without undoing manual review choices
+
+TUI review helpers:
+- From the Xcode category summary action mode: `v` selects very stale safe entries, `3` selects safe entries older than 30 days, `9` selects safe entries older than 90 days, and `u` clears generated bulk selections
+- From an entry checklist action mode: the same `v`, `3`, `9`, and `u` helpers apply only to the current safe category
+- `Archives` and `Device Support` are still excluded from those bulk helpers unless you manually review and select them yourself
+- Cleanup remains explicit, Trash-only, and confirmation-gated after any bulk review action
 
 Current development paths:
 - Log path: `~/Library/Logs/Friction Lab/Cleanroom/cleanroom.log`
