@@ -1,4 +1,4 @@
-use crate::profile::SafetyLevel;
+use crate::profile::{CategorySafetyLevel, CleanupRecommendationKind, SafetyLevel};
 
 pub mod xcode;
 
@@ -21,16 +21,23 @@ pub struct CleanSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanCategoryId {
     DerivedData,
-    DeviceSupport,
     Archives,
-    SimulatorCaches,
+    DeviceSupport,
+    SwiftUIPreviews,
+    Products,
+    DocumentationCache,
+    TestLogs,
+    ResultBundles,
+    TemporaryXcodeBuildFolders,
 }
 
 #[derive(Clone, Debug)]
 pub struct CleanEntry {
     pub name: String,
     pub path: PathBuf,
+    pub allowed_root: PathBuf,
     pub size_bytes: u64,
+    pub file_count: u64,
     pub keep: bool,
     pub metadata: CleanEntryMetadata,
 }
@@ -41,18 +48,25 @@ pub struct CleanCategory {
     pub name: String,
     pub stats_key: Option<String>,
     pub path: PathBuf,
+    pub roots: Vec<PathBuf>,
     pub exists: bool,
     pub note: Option<String>,
     pub warnings: Vec<String>,
     pub entries: Vec<CleanEntry>,
     pub total_size_bytes: u64,
+    pub total_file_count: u64,
     pub metadata: Option<CleanCategoryMetadata>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CleanCategoryMetadata {
     pub description: String,
-    pub safety: SafetyLevel,
+    pub safety: CategorySafetyLevel,
+    pub default_cleanup: bool,
+    pub cleanup_kind: CleanupRecommendationKind,
+    pub reversible: bool,
+    pub move_to_trash: bool,
+    pub caution: Option<String>,
     pub recommendation: String,
     pub impact: String,
 }
@@ -75,28 +89,20 @@ impl CleanCategory {
             .sum()
     }
 
+    pub fn reclaimable_file_count(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| !entry.keep)
+            .map(|entry| entry.file_count)
+            .sum()
+    }
+
     pub fn keep_count(&self) -> usize {
         self.entries.iter().filter(|entry| entry.keep).count()
     }
 
     pub fn remove_count(&self) -> usize {
         self.entries.len().saturating_sub(self.keep_count())
-    }
-
-    pub fn status_label(&self) -> String {
-        if !self.exists {
-            return "not found".to_string();
-        }
-
-        if let Some(note) = &self.note {
-            return note.clone();
-        }
-
-        if self.entries.is_empty() {
-            return "empty".to_string();
-        }
-
-        "ready".to_string()
     }
 }
 
@@ -147,7 +153,10 @@ impl CleanupMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupStatus {
+    /// Item was actually moved to Trash (MoveToTrash mode only).
     Moved,
+    /// Item passed validation in dry-run mode; nothing was touched.
+    DryRunEligible,
     Skipped,
     Failed,
 }
@@ -182,10 +191,14 @@ pub struct CleanupExecutionResult {
     pub mode: CleanupMode,
     pub log_path: PathBuf,
     pub moved_count: usize,
+    /// Items that passed validation in dry-run mode. Always 0 for MoveToTrash runs.
+    pub dry_run_eligible_count: usize,
     pub skipped_count: usize,
     pub failed_count: usize,
     pub cleaned_size_bytes: u64,
     pub moved_items: Vec<CleanupRecord>,
+    /// Items that passed validation in dry-run mode. Always empty for MoveToTrash runs.
+    pub dry_run_eligible_items: Vec<CleanupRecord>,
     pub skipped_items: Vec<CleanupRecord>,
     pub failed_items: Vec<CleanupRecord>,
     pub warnings: Vec<String>,
@@ -204,10 +217,12 @@ impl CleanupExecutionResult {
             mode,
             log_path,
             moved_count: 0,
+            dry_run_eligible_count: 0,
             skipped_count: 0,
             failed_count: 0,
             cleaned_size_bytes: 0,
             moved_items: Vec::new(),
+            dry_run_eligible_items: Vec::new(),
             skipped_items: Vec::new(),
             failed_items: Vec::new(),
             warnings: Vec::new(),
@@ -220,6 +235,12 @@ impl CleanupExecutionResult {
                 self.moved_count += 1;
                 self.cleaned_size_bytes += record.size_bytes;
                 self.moved_items.push(record);
+            }
+            CleanupStatus::DryRunEligible => {
+                // Track eligible items without incrementing moved_count or cleaned_size_bytes.
+                // Nothing was actually moved; the item passed validation only.
+                self.dry_run_eligible_count += 1;
+                self.dry_run_eligible_items.push(record);
             }
             CleanupStatus::Skipped => {
                 self.skipped_count += 1;

@@ -42,9 +42,61 @@ pub struct ProfileCategory {
     pub name: String,
     pub path: String,
     pub description: String,
-    pub safety: SafetyLevel,
+    pub safety: CategorySafetyLevel,
+    #[serde(default)]
+    pub default_cleanup: bool,
+    #[serde(default)]
+    pub cleanup_kind: CleanupRecommendationKind,
+    #[serde(default = "default_true")]
+    pub reversible: bool,
+    #[serde(default = "default_true")]
+    pub move_to_trash: bool,
+    #[serde(default)]
+    pub caution: Option<String>,
     pub recommendation: String,
     pub impact: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CategorySafetyLevel {
+    HighConfidence,
+    MediumConfidence,
+    #[default]
+    HighCaution,
+}
+
+impl CategorySafetyLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            CategorySafetyLevel::HighConfidence => "High confidence",
+            CategorySafetyLevel::MediumConfidence => "Medium confidence",
+            CategorySafetyLevel::HighCaution => "High caution",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CleanupRecommendationKind {
+    SafeCleanupCandidate,
+    ReviewCarefully,
+    #[default]
+    KeepByDefault,
+}
+
+impl CleanupRecommendationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            CleanupRecommendationKind::SafeCleanupCandidate => "Safe cleanup candidate",
+            CleanupRecommendationKind::ReviewCarefully => "Review carefully",
+            CleanupRecommendationKind::KeepByDefault => "Keep by default",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -184,7 +236,9 @@ fn simple_glob_match(pattern: &str, artifact_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CleanerProfile, RuleMatchType, SafetyLevel};
+    use super::{
+        CategorySafetyLevel, CleanerProfile, CleanupRecommendationKind, RuleMatchType, SafetyLevel,
+    };
 
     #[test]
     fn bundled_xcode_profile_loads_successfully() {
@@ -193,12 +247,12 @@ mod tests {
         assert_eq!(profile.id, "xcode");
         assert_eq!(profile.name, "Xcode");
         assert_eq!(profile.platform, "macos");
-        assert_eq!(profile.categories.len(), 4);
+        assert_eq!(profile.categories.len(), 9);
         assert!(profile.rules.len() >= 5);
     }
 
     #[test]
-    fn parses_safety_levels_from_toml() {
+    fn parses_category_metadata_from_toml() {
         let profile = CleanerProfile::from_toml_str(
             r#"
 id = "test"
@@ -211,14 +265,30 @@ id = "sample"
 name = "Sample"
 path = "~/Library/Sample"
 description = "Sample category"
-safety = "protected"
+safety = "high-caution"
+default_cleanup = false
+cleanup_kind = "keep-by-default"
+reversible = true
+move_to_trash = true
+caution = "Review before cleaning."
 recommendation = "Leave alone"
 impact = "Loss is difficult to recover."
 "#,
         )
         .expect("profile should parse");
 
-        assert_eq!(profile.categories[0].safety, SafetyLevel::Protected);
+        assert_eq!(
+            profile.categories[0].safety,
+            CategorySafetyLevel::HighCaution
+        );
+        assert_eq!(
+            profile.categories[0].cleanup_kind,
+            CleanupRecommendationKind::KeepByDefault
+        );
+        assert_eq!(
+            profile.categories[0].caution.as_deref(),
+            Some("Review before cleaning.")
+        );
     }
 
     #[test]

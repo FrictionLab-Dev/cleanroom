@@ -51,9 +51,13 @@ Check the current Xcode cleanup roots:
 
 ```sh
 ls -ld "$HOME/Library/Developer/Xcode/DerivedData" 2>/dev/null || echo "DerivedData not found"
-ls -ld "$HOME/Library/Developer/Xcode/iOS DeviceSupport" 2>/dev/null || echo "iOS DeviceSupport not found"
 ls -ld "$HOME/Library/Developer/Xcode/Archives" 2>/dev/null || echo "Archives not found"
-ls -ld "$HOME/Library/Developer/CoreSimulator/Caches" 2>/dev/null || echo "CoreSimulator Caches not found"
+ls -ld "$HOME/Library/Developer/Xcode/iOS DeviceSupport" 2>/dev/null || echo "iOS DeviceSupport not found"
+ls -ld "$HOME/Library/Developer/Xcode/watchOS DeviceSupport" 2>/dev/null || echo "watchOS DeviceSupport not found"
+ls -ld "$HOME/Library/Developer/Xcode/tvOS DeviceSupport" 2>/dev/null || echo "tvOS DeviceSupport not found"
+ls -ld "$HOME/Library/Developer/Xcode/UserData/Previews" 2>/dev/null || echo "Previews not found"
+ls -ld "$HOME/Library/Developer/Xcode/Products" 2>/dev/null || echo "Products not found"
+ls -ld "$HOME/Library/Developer/Xcode/DocumentationCache" 2>/dev/null || echo "DocumentationCache not found"
 ```
 
 Check or create the log directory:
@@ -75,30 +79,43 @@ Notes:
 
 Current scope:
 - Xcode cleanup only
-- `DerivedData`
-- `iOS DeviceSupport`
+- `Derived Data`
 - `Archives`
-- `CoreSimulator/Caches`
+- `Device Support` (`iOS`, `watchOS`, `tvOS`)
+- `SwiftUI Previews`
+- `Products`
+- `Documentation Cache`
+- `Test Logs`
+- `Result Bundles`
+- bounded `/private/tmp` Xcode build artifacts only (`xcodebuild-*`, matching `TemporaryItems` entries)
 
 Current behavior:
-- Scans known Xcode cache roots and summarizes size
-- Shows one level at a time in the TUI
+- Scans bounded Xcode developer storage roots and summarizes size plus file counts by category
+- Keeps the pass scan-first and review-first: categories are explained before cleanup
+- Shows category-level safety, cleanup recommendation, caution text, and default cleanup stance in the TUI
 - Uses profile metadata to explain categories and artifacts in the right-side summary panels
-- Users choose what to keep
-- Anything not kept becomes a cleanup candidate
+- High-confidence categories such as `Derived Data`, `SwiftUI Previews`, `Documentation Cache`, `Test Logs`, and `Result Bundles` can be pre-marked as cleanup candidates
+- `Archives` and `Device Support` stay keep-by-default and high-caution
+- Users can still review each category and choose what to keep
 - Cleanup requires explicit confirmation
 - Default cleanup action moves items to macOS Trash
 
-Safety levels:
-- `recommended`: usually a good cleanup candidate when stale
-- `rebuildable`: generated caches or outputs that tools can recreate
-- `caution`: review before cleaning because the artifact may still be useful
-- `protected`: generally avoid cleaning
-- `unknown`: unmatched artifact, inspect before cleaning
+Category safety levels:
+- `high confidence`: generally safe generated developer storage
+- `medium confidence`: generated artifacts that still deserve review
+- `high caution`: keep-by-default storage that may still matter for releases or device debugging
+
+Cleanup recommendation badges:
+- `Safe cleanup candidate`
+- `Review carefully`
+- `Keep by default`
 
 Profile metadata includes:
 - What an artifact or category represents
 - Why it may be safe or unsafe to clean
+- Whether it is selected by default for cleanup
+- Whether cleanup is reversible and should move to Trash
+- Caution text for review-first categories
 - Expected impact after cleaning
 - A recommendation for review or cleanup
 
@@ -107,6 +124,9 @@ Safety notes:
 - Cleanroom does not use `rm -rf`
 - Entries are validated against known Xcode roots before cleanup
 - Symlinks are skipped instead of followed blindly
+- Missing folders produce zero-size findings instead of scan failures
+- `/private/tmp` scanning stays tightly bounded to clearly Xcode-related patterns
+- Archives and Device Support are not default cleanup targets in this pass
 - Cleanup profiles are descriptive only and cannot execute cleanup actions
 - Cleanup logs are written to `~/Library/Logs/Friction Lab/Cleanroom/cleanroom.log`
 

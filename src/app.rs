@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     cleanup,
-    profile::SafetyLevel,
+    profile::{CategorySafetyLevel, CleanupRecommendationKind, SafetyLevel},
     scanner,
     size::format_bytes,
     sources::{
@@ -274,8 +274,8 @@ impl App {
 
     pub fn category_table_header(&self) -> String {
         format!(
-            "{:<14} {:>9} {:>10} {:>7}  {:<8}",
-            "Category", "Total", "Selected", "Entries", "Status"
+            "{:<18} {:>9} {:>9} {:>7}  {:<16}",
+            "Category", "Total", "Selected", "Files", "Safety"
         )
     }
 
@@ -287,12 +287,16 @@ impl App {
                     .iter()
                     .map(|category| {
                         format!(
-                            "{:<14} {:>9} {:>10} {:>7}  {:<8}",
-                            truncate_text(&category.name, 14),
+                            "{:<18} {:>9} {:>9} {:>7}  {:<16}",
+                            truncate_text(&category.name, 18),
                             format_bytes(category.total_size_bytes),
                             format_bytes(category.reclaimable_size_bytes()),
-                            category.entries.len(),
-                            category.status_label()
+                            category.total_file_count,
+                            category
+                                .metadata
+                                .as_ref()
+                                .map(|metadata| category_safety_badge(metadata.safety))
+                                .unwrap_or("Unknown")
                         )
                     })
                     .collect()
@@ -339,12 +343,16 @@ impl App {
         let mut rows = vec![
             "These items will be moved to Trash, not permanently deleted.".to_string(),
             format!(
-                "Selected-to-clean size: {} | Cleanup candidates: {}",
+                "Selected-to-clean size: {} | Candidates: {} | Files: {}",
                 format_bytes(plan.total_reclaimable_bytes),
-                plan.removal_count
+                plan.removal_count,
+                self.total_reclaimable_file_count()
             ),
             String::new(),
         ];
+
+        rows.extend(self.preview_policy_lines());
+        rows.push(String::new());
 
         rows.extend(plan.preview_items.iter().map(|item| {
             format!(
@@ -367,6 +375,7 @@ impl App {
                 format_bytes(plan.total_reclaimable_bytes)
             ),
             format!("Cleanup candidates: {}", plan.removal_count),
+            format!("Selected files: {}", self.total_reclaimable_file_count()),
             "These items will be moved to Trash, not permanently deleted.".to_string(),
             "Press y to confirm or n / Esc to cancel.".to_string(),
         ]
@@ -379,6 +388,10 @@ impl App {
 
         let mut rows = vec![
             format!("Moved to Trash: {} entries", result.moved_count),
+            format!(
+                "Dry-run eligible: {} entries",
+                result.dry_run_eligible_count
+            ),
             format!("Reclaimed: {}", format_bytes(result.cleaned_size_bytes)),
             format!("Skipped safely: {} entries", result.skipped_count),
             format!("Failed moves: {} entries", result.failed_count),
@@ -492,25 +505,31 @@ impl App {
             ),
             Screen::PreviewCleanup => {
                 let plan = self.preview_plan();
-                vec![
+                let mut lines = vec![
                     format!(
                         "Selected-to-clean size: {}",
                         format_bytes(plan.total_reclaimable_bytes)
                     ),
                     format!("Cleanup candidates: {}", plan.removal_count),
+                    format!("Selected files: {}", self.total_reclaimable_file_count()),
                     "These items will be moved to Trash, not permanently deleted.".to_string(),
-                ]
+                ];
+                lines.extend(self.preview_policy_lines());
+                lines
             }
             Screen::ConfirmCleanup => {
                 let plan = self.preview_plan();
-                vec![
+                let mut lines = vec![
                     format!(
                         "Selected-to-clean size: {}",
                         format_bytes(plan.total_reclaimable_bytes)
                     ),
                     format!("Cleanup candidates: {}", plan.removal_count),
+                    format!("Selected files: {}", self.total_reclaimable_file_count()),
                     "These items will be moved to Trash, not permanently deleted.".to_string(),
-                ]
+                ];
+                lines.extend(self.preview_policy_lines());
+                lines
             }
             Screen::CleanupResult => self
                 .cleanup_result
@@ -563,6 +582,18 @@ impl App {
             .unwrap_or(0)
     }
 
+    fn total_file_count(&self) -> u64 {
+        self.xcode_scan
+            .as_ref()
+            .map(|scan| {
+                scan.categories
+                    .iter()
+                    .map(|category| category.total_file_count)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
     fn total_reclaimable_bytes(&self) -> u64 {
         self.xcode_scan
             .as_ref()
@@ -570,6 +601,18 @@ impl App {
                 scan.categories
                     .iter()
                     .map(CleanCategory::reclaimable_size_bytes)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    fn total_reclaimable_file_count(&self) -> u64 {
+        self.xcode_scan
+            .as_ref()
+            .map(|scan| {
+                scan.categories
+                    .iter()
+                    .map(CleanCategory::reclaimable_file_count)
                     .sum()
             })
             .unwrap_or(0)
@@ -682,7 +725,7 @@ impl App {
         match self.selected_source() {
             Some(source) if source.id == CleanSourceId::Xcode => vec![
                 "Scan known Xcode cache locations.".to_string(),
-                "Supported categories: DerivedData, DeviceSupport, Archives, Simulator Caches."
+                "Supported categories: Derived Data, Archives, Device Support, SwiftUI Previews, Products, Documentation Cache, Test Logs, Result Bundles, and bounded Xcode temp folders."
                     .to_string(),
                 format!(
                     "Status: {}",
@@ -715,24 +758,67 @@ impl App {
             .map(|category| {
                 let mut lines = vec![
                     format!("Category: {}", category.name),
+                    format!(
+                        "Root status: {}",
+                        if category.exists { "available" } else { "missing" }
+                    ),
                     format!("Total size: {}", format_bytes(category.total_size_bytes)),
+                    format!("Total files: {}", category.total_file_count),
                     format!(
                         "Selected to clean: {}",
                         format_bytes(category.reclaimable_size_bytes())
                     ),
+                    format!("Selected files: {}", category.reclaimable_file_count()),
                     format!("Kept entries: {}", category.keep_count()),
                     format!("Cleanup candidates: {}", category.remove_count()),
                 ];
 
                 if let Some(metadata) = &category.metadata {
-                    lines.push(format!("Safety: {}", safety_label(metadata.safety)));
+                    lines.push(format!("Safety: {}", category_safety_label(metadata.safety)));
+                    lines.push(format!(
+                        "Recommendation: {}",
+                        cleanup_kind_label(metadata.cleanup_kind)
+                    ));
+                    lines.push(format!(
+                        "Default cleanup: {}",
+                        if metadata.default_cleanup {
+                            "selected by default"
+                        } else {
+                            "review first"
+                        }
+                    ));
+                    lines.push(format!(
+                        "Cleanup mode: {}",
+                        if metadata.move_to_trash && metadata.reversible {
+                            "move to Trash"
+                        } else {
+                            "review only"
+                        }
+                    ));
                     lines.push(format!("Summary: {}", metadata.description));
                     lines.push(format!("Impact: {}", metadata.impact));
-                    lines.push(format!("Recommendation: {}", metadata.recommendation));
+                    lines.push(format!("Guidance: {}", metadata.recommendation));
+                    if let Some(caution) = &metadata.caution {
+                        lines.push(format!("Caution: {}", caution));
+                    }
                 } else {
-                    lines.push(format!("Safety: {}", safety_label(SafetyLevel::Unknown)));
+                    lines.push(format!(
+                        "Safety: {}",
+                        category_safety_label(CategorySafetyLevel::HighCaution)
+                    ));
                     lines.push("Summary: Profile metadata unavailable.".to_string());
                     lines.push("Recommendation: Inspect entries before cleaning.".to_string());
+                }
+
+                if !category.roots.is_empty() {
+                    lines.push(format!("Roots scanned: {}", category.roots.len()));
+                    for root in &category.roots {
+                        lines.push(format!("Root: {}", shorten_path(root, 48)));
+                    }
+                }
+
+                if let Some(note) = &category.note {
+                    lines.push(format!("Scan status: {}", note));
                 }
 
                 lines
@@ -741,11 +827,13 @@ impl App {
                 vec![
                     "Source: Xcode".to_string(),
                     format!("Total size: {}", format_bytes(self.total_size_bytes())),
+                    format!("Total files: {}", self.total_file_count()),
                     format!(
                         "Selected to clean: {}",
                         format_bytes(self.total_reclaimable_bytes())
                     ),
-                    "Safety: cleanup moves selected entries to Trash after confirmation."
+                    format!("Selected files: {}", self.total_reclaimable_file_count()),
+                    "Safety: cleanup remains review-first and moves selected entries to Trash after confirmation."
                         .to_string(),
                     "Hint: Enter opens category.".to_string(),
                 ]
@@ -757,6 +845,7 @@ impl App {
             return vec![
                 format!("Category: {}", category.name),
                 format!("Total size: {}", format_bytes(category.total_size_bytes)),
+                format!("Total files: {}", category.total_file_count),
                 "No entry selected.".to_string(),
             ];
         };
@@ -765,6 +854,7 @@ impl App {
             format!("Entry: {}", entry.name),
             format!("Category: {}", category.name),
             format!("Size: {}", format_bytes(entry.size_bytes)),
+            format!("Files: {}", entry.file_count),
             format!("Safety: {}", safety_label(entry.metadata.safety)),
         ];
 
@@ -793,6 +883,7 @@ impl App {
     fn cleanup_result_detail_lines(&self, result: &CleanupExecutionResult) -> Vec<String> {
         let mut lines = vec![
             format!("Moved to Trash: {}", result.moved_count),
+            format!("Dry-run eligible: {}", result.dry_run_eligible_count),
             format!("Skipped: {}", result.skipped_count),
             format!("Failed: {}", result.failed_count),
             format!("Reclaimed: {}", format_bytes(result.cleaned_size_bytes)),
@@ -811,15 +902,63 @@ impl App {
 
         lines
     }
+
+    fn preview_policy_lines(&self) -> Vec<String> {
+        let Some(scan) = &self.xcode_scan else {
+            return Vec::new();
+        };
+
+        let mut review = Vec::new();
+        let mut keep_by_default = Vec::new();
+
+        for category in &scan.categories {
+            if category.remove_count() == 0 {
+                continue;
+            }
+
+            let Some(metadata) = &category.metadata else {
+                continue;
+            };
+
+            match metadata.cleanup_kind {
+                CleanupRecommendationKind::SafeCleanupCandidate => {}
+                CleanupRecommendationKind::ReviewCarefully => review.push(category.name.clone()),
+                CleanupRecommendationKind::KeepByDefault => {
+                    keep_by_default.push(category.name.clone())
+                }
+            }
+        }
+
+        let mut lines = Vec::new();
+        if review.is_empty() && keep_by_default.is_empty() {
+            lines.push("Selected categories are in the safe cleanup candidate tier.".to_string());
+            return lines;
+        }
+
+        if !review.is_empty() {
+            lines.push(format!("Review carefully: {}", review.join(", ")));
+        }
+
+        if !keep_by_default.is_empty() {
+            lines.push(format!("Keep by default: {}", keep_by_default.join(", ")));
+        }
+
+        lines
+    }
 }
 
 fn is_known_category(category_id: CleanCategoryId) -> bool {
     matches!(
         category_id,
         CleanCategoryId::DerivedData
-            | CleanCategoryId::DeviceSupport
             | CleanCategoryId::Archives
-            | CleanCategoryId::SimulatorCaches
+            | CleanCategoryId::DeviceSupport
+            | CleanCategoryId::SwiftUIPreviews
+            | CleanCategoryId::Products
+            | CleanCategoryId::DocumentationCache
+            | CleanCategoryId::TestLogs
+            | CleanCategoryId::ResultBundles
+            | CleanCategoryId::TemporaryXcodeBuildFolders
     )
 }
 
@@ -868,4 +1007,20 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
 
 fn safety_label(safety: SafetyLevel) -> &'static str {
     safety.label()
+}
+
+fn category_safety_label(safety: CategorySafetyLevel) -> &'static str {
+    safety.label()
+}
+
+fn category_safety_badge(safety: CategorySafetyLevel) -> &'static str {
+    match safety {
+        CategorySafetyLevel::HighConfidence => "High confidence",
+        CategorySafetyLevel::MediumConfidence => "Medium confidence",
+        CategorySafetyLevel::HighCaution => "High caution",
+    }
+}
+
+fn cleanup_kind_label(kind: CleanupRecommendationKind) -> &'static str {
+    kind.label()
 }
