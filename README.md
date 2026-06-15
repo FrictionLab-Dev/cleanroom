@@ -92,12 +92,15 @@ Current scope:
 Current behavior:
 - Scans bounded Xcode developer storage roots and summarizes size plus file counts by category
 - Keeps the pass scan-first and review-first: categories are explained before cleanup
-- Shows category-level safety, cleanup recommendation, caution text, and default cleanup stance in the TUI
+- Shows category-level safety, cleanup recommendation, caution text, default cleanup stance, and stale-first review hints in the TUI
 - Uses profile metadata to explain categories and artifacts in the right-side summary panels
 - High-confidence categories such as `Derived Data`, `SwiftUI Previews`, `Documentation Cache`, `Test Logs`, and `Result Bundles` can be pre-marked as cleanup candidates
 - `Archives` and `Device Support` stay keep-by-default and high-caution
+- Entry review is stale-first and size-aware so older and heavier artifacts surface first
+- Entry details include age labels and last-modified date labels when metadata is available
 - Users can still review each category and choose what to keep
 - Cleanup requires explicit confirmation
+- Cleanup plans that include `Archives` or `Device Support` require a typed high-caution confirmation before the final confirm screen
 - Default cleanup action moves items to macOS Trash
 
 Category safety levels:
@@ -127,8 +130,15 @@ Safety notes:
 - Missing folders produce zero-size findings instead of scan failures
 - `/private/tmp` scanning stays tightly bounded to clearly Xcode-related patterns
 - Archives and Device Support are not default cleanup targets in this pass
+- Archives and Device Support still require an extra typed confirmation even if you manually mark them for cleanup
 - Cleanup profiles are descriptive only and cannot execute cleanup actions
 - Cleanup logs are written to `~/Library/Logs/Friction Lab/Cleanroom/cleanroom.log`
+
+Review behavior:
+- Categories keep a scan-first posture: totals, selected size, file count, safety, and stale signals are shown before cleanup
+- Entry ordering favors very stale items first, then stale items, then size, then stable alphabetical order
+- Preview ordering also surfaces high-caution selections first so risky cleanup plans are obvious
+- Missing modified-time metadata falls back to `Unknown` without blocking scanning or cleanup preview
 
 Current development paths:
 - Log path: `~/Library/Logs/Friction Lab/Cleanroom/cleanroom.log`

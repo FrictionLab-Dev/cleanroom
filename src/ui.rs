@@ -118,6 +118,17 @@ fn render_main_area(frame: &mut Frame, area: Rect, app: &App) {
             PanelSpec::new("Preview", None, app.preview_rows(), None),
             TextPanelSpec::new("Summary", app.detail_panel_lines()),
         ),
+        Screen::HighCautionConfirmation => render_split_panels(
+            frame,
+            area,
+            PanelSpec::new(
+                "Type Confirmation",
+                None,
+                app.high_caution_confirmation_rows(),
+                None,
+            ),
+            TextPanelSpec::new("Summary", app.detail_panel_lines()),
+        ),
         Screen::ConfirmCleanup => render_split_panels(
             frame,
             area,

@@ -1,6 +1,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -11,7 +12,7 @@ use crate::{
     size::path_metrics,
     sources::{
         CleanCategory, CleanCategoryId, CleanCategoryMetadata, CleanEntry, CleanEntryMetadata,
-        CleanSourceId, ScannedSource,
+        CleanSourceId, EntryAge, ScannedSource, StaleBucket,
     },
 };
 
@@ -51,6 +52,14 @@ pub(crate) fn scan_for_home(home_dir: &Path) -> ScannedSource {
 }
 
 fn scan_for_home_with_tmp_root(home_dir: &Path, tmp_root_override: Option<&Path>) -> ScannedSource {
+    scan_for_home_with_tmp_root_and_now(home_dir, tmp_root_override, SystemTime::now())
+}
+
+fn scan_for_home_with_tmp_root_and_now(
+    home_dir: &Path,
+    tmp_root_override: Option<&Path>,
+    now: SystemTime,
+) -> ScannedSource {
     let mut warnings = Vec::new();
     let loaded_profile = match load_xcode_profile() {
         Ok(profile) => Some(profile),
@@ -73,6 +82,7 @@ fn scan_for_home_with_tmp_root(home_dir: &Path, tmp_root_override: Option<&Path>
                 spec,
                 home_dir,
                 tmp_root_override,
+                now,
                 loaded_profile.as_ref(),
                 &mut warnings,
             )
@@ -406,6 +416,7 @@ fn scan_category(
     spec: &CategorySpec,
     home_dir: &Path,
     tmp_root_override: Option<&Path>,
+    now: SystemTime,
     loaded_profile: Option<&LoadedProfile>,
     warnings: &mut Vec<String>,
 ) -> CleanCategory {
@@ -417,11 +428,13 @@ fn scan_category(
     let profile = loaded_profile.map(|loaded| &loaded.profile);
 
     let category = match spec.scan_kind {
-        ScanKind::ImmediateChildren => scan_immediate_children_category(spec, &roots, profile),
-        ScanKind::DerivedDataTestLogs => scan_test_logs_category(spec, &roots, profile),
-        ScanKind::DerivedDataResultBundles => scan_result_bundles_category(spec, &roots, profile),
+        ScanKind::ImmediateChildren => scan_immediate_children_category(spec, &roots, now, profile),
+        ScanKind::DerivedDataTestLogs => scan_test_logs_category(spec, &roots, now, profile),
+        ScanKind::DerivedDataResultBundles => {
+            scan_result_bundles_category(spec, &roots, now, profile)
+        }
         ScanKind::TemporaryXcodeBuildFolders => {
-            scan_temporary_xcode_category(spec, &roots, profile)
+            scan_temporary_xcode_category(spec, &roots, now, profile)
         }
     };
 
@@ -432,6 +445,7 @@ fn scan_category(
 fn scan_immediate_children_category(
     spec: &CategorySpec,
     roots: &[PathBuf],
+    now: SystemTime,
     profile: Option<&CleanerProfile>,
 ) -> CleanCategory {
     let mut entries = Vec::new();
@@ -474,6 +488,7 @@ fn scan_immediate_children_category(
                     display_name,
                     entry.path(),
                     root.clone(),
+                    now,
                     &spec.metadata,
                     profile,
                     &mut category_warnings,
@@ -497,6 +512,7 @@ fn scan_immediate_children_category(
 fn scan_test_logs_category(
     spec: &CategorySpec,
     roots: &[PathBuf],
+    now: SystemTime,
     profile: Option<&CleanerProfile>,
 ) -> CleanCategory {
     let Some(derived_data_root) = roots.first().cloned() else {
@@ -551,6 +567,7 @@ fn scan_test_logs_category(
                     display_name,
                     logs_test_path,
                     derived_data_root.clone(),
+                    now,
                     &spec.metadata,
                     profile,
                     &mut category_warnings,
@@ -574,6 +591,7 @@ fn scan_test_logs_category(
 fn scan_result_bundles_category(
     spec: &CategorySpec,
     roots: &[PathBuf],
+    now: SystemTime,
     profile: Option<&CleanerProfile>,
 ) -> CleanCategory {
     let Some(derived_data_root) = roots.first().cloned() else {
@@ -606,6 +624,7 @@ fn scan_result_bundles_category(
             relative_name,
             path,
             derived_data_root.clone(),
+            now,
             &spec.metadata,
             profile,
             &mut category_warnings,
@@ -627,6 +646,7 @@ fn scan_result_bundles_category(
 fn scan_temporary_xcode_category(
     spec: &CategorySpec,
     roots: &[PathBuf],
+    now: SystemTime,
     profile: Option<&CleanerProfile>,
 ) -> CleanCategory {
     let Some(tmp_root) = roots.first().cloned() else {
@@ -662,6 +682,7 @@ fn scan_temporary_xcode_category(
                         child_name,
                         child_path,
                         tmp_root.clone(),
+                        now,
                         &spec.metadata,
                         profile,
                         &mut category_warnings,
@@ -725,6 +746,7 @@ fn scan_temporary_xcode_category(
                         format!("TemporaryItems / {nested_name}"),
                         nested.path(),
                         tmp_root.clone(),
+                        now,
                         &spec.metadata,
                         profile,
                         &mut category_warnings,
@@ -754,12 +776,7 @@ fn finish_category(
     category_warnings: Vec<String>,
     empty_note: Option<&str>,
 ) -> CleanCategory {
-    entries.sort_by(|left, right| {
-        right
-            .size_bytes
-            .cmp(&left.size_bytes)
-            .then_with(|| left.name.cmp(&right.name))
-    });
+    sort_entries(&mut entries);
 
     let total_size_bytes = entries.iter().map(|entry| entry.size_bytes).sum();
     let total_file_count = entries.iter().map(|entry| entry.file_count).sum();
@@ -793,6 +810,26 @@ fn finish_category(
         total_file_count,
         metadata: Some(spec.metadata.clone()),
     }
+}
+
+fn sort_entries(entries: &mut [CleanEntry]) {
+    entries.sort_by(|left, right| {
+        right
+            .age
+            .stale_bucket
+            .sort_rank()
+            .cmp(&left.age.stale_bucket.sort_rank())
+            .then_with(|| {
+                right
+                    .age
+                    .age_seconds
+                    .unwrap_or(0)
+                    .cmp(&left.age.age_seconds.unwrap_or(0))
+            })
+            .then_with(|| right.size_bytes.cmp(&left.size_bytes))
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.path.cmp(&right.path))
+    });
 }
 
 fn missing_category(spec: &CategorySpec, roots: &[PathBuf]) -> CleanCategory {
@@ -864,6 +901,7 @@ fn clean_entry_from_path(
     name: String,
     path: PathBuf,
     allowed_root: PathBuf,
+    now: SystemTime,
     category_metadata: &CleanCategoryMetadata,
     profile: Option<&CleanerProfile>,
     warnings: &mut Vec<String>,
@@ -893,6 +931,7 @@ fn clean_entry_from_path(
         allowed_root,
         size_bytes: metrics.size_bytes,
         file_count: metrics.file_count,
+        age: entry_age_from_metrics(&metrics, now),
         keep: !category_metadata.default_cleanup,
         metadata: entry_metadata(&name, profile, category_metadata),
     })
@@ -932,6 +971,99 @@ fn entry_safety_from_category(cleanup_kind: CleanupRecommendationKind) -> Safety
         CleanupRecommendationKind::ReviewCarefully => SafetyLevel::Caution,
         CleanupRecommendationKind::KeepByDefault => SafetyLevel::Protected,
     }
+}
+
+fn entry_age_from_metrics(metrics: &crate::size::PathMetrics, now: SystemTime) -> EntryAge {
+    let Some(last_modified_unix_seconds) = metrics.last_modified_unix_seconds else {
+        return EntryAge {
+            last_modified_unix_seconds: None,
+            last_modified_label: "Unknown".to_string(),
+            age_seconds: None,
+            age_label: "Unknown".to_string(),
+            stale_bucket: StaleBucket::Unknown,
+        };
+    };
+
+    let last_modified_time = UNIX_EPOCH + Duration::from_secs(last_modified_unix_seconds);
+    let age_seconds = now
+        .duration_since(last_modified_time)
+        .ok()
+        .map(|duration| duration.as_secs());
+
+    EntryAge {
+        last_modified_unix_seconds: Some(last_modified_unix_seconds),
+        last_modified_label: format_unix_date(last_modified_unix_seconds),
+        age_label: age_seconds
+            .map(format_age_label)
+            .unwrap_or_else(|| "Unknown".to_string()),
+        stale_bucket: age_seconds
+            .map(stale_bucket_for_age)
+            .unwrap_or(StaleBucket::Unknown),
+        age_seconds,
+    }
+}
+
+fn stale_bucket_for_age(age_seconds: u64) -> StaleBucket {
+    const DAY: u64 = 24 * 60 * 60;
+    if age_seconds < 2 * DAY {
+        StaleBucket::Fresh
+    } else if age_seconds < 14 * DAY {
+        StaleBucket::Recent
+    } else if age_seconds < 90 * DAY {
+        StaleBucket::Stale
+    } else {
+        StaleBucket::VeryStale
+    }
+}
+
+fn format_age_label(age_seconds: u64) -> String {
+    const DAY: u64 = 24 * 60 * 60;
+    if age_seconds < DAY {
+        return "Today".to_string();
+    }
+
+    let days = age_seconds / DAY;
+    if days < 7 {
+        return pluralized(days, "day");
+    }
+
+    if days < 30 {
+        return pluralized(days / 7, "week");
+    }
+
+    if days < 365 {
+        return pluralized(days / 30, "month");
+    }
+
+    pluralized(days / 365, "year")
+}
+
+fn pluralized(value: u64, unit: &str) -> String {
+    if value == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{value} {unit}s")
+    }
+}
+
+fn format_unix_date(unix_seconds: u64) -> String {
+    let days_since_epoch = unix_seconds / 86_400;
+    let (year, month, day) = civil_from_days(days_since_epoch as i64);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year as i32, m as u32, d as u32)
 }
 
 fn category_stats_key(category_id: CleanCategoryId) -> String {
@@ -1026,13 +1158,19 @@ fn is_temporary_items_xcode_artifact(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use crate::profile::{CategorySafetyLevel, CleanupRecommendationKind, SafetyLevel};
+    use crate::sources::{CleanEntry, CleanEntryMetadata, EntryAge, StaleBucket};
 
     use super::{
-        allowed_roots_for_home_with_tmp_root, entry_metadata, load_xcode_profile, scan_for_home,
-        scan_for_home_with_tmp_root,
+        allowed_roots_for_home_with_tmp_root, entry_age_from_metrics, entry_metadata,
+        format_age_label, load_xcode_profile, scan_for_home, scan_for_home_with_tmp_root,
+        scan_for_home_with_tmp_root_and_now, sort_entries, stale_bucket_for_age,
     };
 
     fn temp_home(name: &str) -> PathBuf {
@@ -1054,6 +1192,33 @@ mod tests {
             fs::create_dir_all(parent).expect("parent should exist");
         }
         fs::write(path, vec![b'x'; bytes]).expect("fixture file should write");
+    }
+
+    fn dummy_entry(name: &str, size_bytes: u64, age_seconds: Option<u64>) -> CleanEntry {
+        let age = age_seconds.map_or_else(EntryAge::default, |age_seconds| EntryAge {
+            last_modified_unix_seconds: Some(1),
+            last_modified_label: "1970-01-01".to_string(),
+            age_seconds: Some(age_seconds),
+            age_label: format_age_label(age_seconds),
+            stale_bucket: stale_bucket_for_age(age_seconds),
+        });
+
+        CleanEntry {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/tmp/{name}")),
+            allowed_root: PathBuf::from("/tmp"),
+            size_bytes,
+            file_count: 1,
+            age,
+            keep: false,
+            metadata: CleanEntryMetadata {
+                matched_rule: None,
+                description: "Generated artifact.".to_string(),
+                safety: SafetyLevel::Recommended,
+                recommendation: "Review.".to_string(),
+                impact: None,
+            },
+        }
     }
 
     #[test]
@@ -1111,6 +1276,28 @@ mod tests {
         assert_eq!(derived_data.total_size_bytes, 0);
         assert_eq!(derived_data.total_file_count, 0);
         assert!(derived_data.warnings.is_empty());
+    }
+
+    #[test]
+    fn age_metadata_from_recent_temp_files_is_available() {
+        let home = temp_home("age-now");
+        write_file(
+            &home.join("Library/Developer/Xcode/DerivedData/AppA/Build/file1"),
+            10,
+        );
+
+        let scan = scan_for_home(&home);
+        let entry = scan
+            .categories
+            .iter()
+            .find(|category| category.name == "Derived Data")
+            .and_then(|category| category.entries.first())
+            .expect("derived data entry should exist");
+
+        assert!(entry.age.last_modified_unix_seconds.is_some());
+        assert_ne!(entry.age.last_modified_label, "Unknown");
+        assert_ne!(entry.age.age_label, "Unknown");
+        assert_eq!(entry.age.stale_bucket, StaleBucket::Fresh);
     }
 
     #[test]
@@ -1216,6 +1403,61 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_old_timestamps_produce_stale_buckets() {
+        let now = UNIX_EPOCH + Duration::from_secs(200 * 24 * 60 * 60);
+        let metrics = crate::size::PathMetrics {
+            size_bytes: 10,
+            file_count: 1,
+            last_modified_unix_seconds: Some(10 * 24 * 60 * 60),
+        };
+
+        let age = entry_age_from_metrics(&metrics, now);
+
+        assert_eq!(age.age_label, "6 months");
+        assert_eq!(age.stale_bucket, StaleBucket::VeryStale);
+        assert_eq!(age.last_modified_label, "1970-01-11");
+    }
+
+    #[test]
+    fn unknown_age_is_handled_without_crashing() {
+        let age = entry_age_from_metrics(&crate::size::PathMetrics::default(), SystemTime::now());
+
+        assert_eq!(age.age_label, "Unknown");
+        assert_eq!(age.last_modified_label, "Unknown");
+        assert_eq!(age.stale_bucket, StaleBucket::Unknown);
+    }
+
+    #[test]
+    fn entries_sort_stale_first_then_size_then_name() {
+        let mut entries = vec![
+            dummy_entry("beta", 100, Some(120 * 24 * 60 * 60)),
+            dummy_entry("alpha", 200, Some(120 * 24 * 60 * 60)),
+            dummy_entry("fresh", 999, Some(60 * 60)),
+            dummy_entry("unknown", 500, None),
+        ];
+
+        sort_entries(&mut entries);
+
+        assert_eq!(entries[0].name, "alpha");
+        assert_eq!(entries[1].name, "beta");
+        assert_eq!(entries[2].name, "fresh");
+        assert_eq!(entries[3].name, "unknown");
+    }
+
+    #[test]
+    fn size_tiebreaker_is_stable_with_alphabetical_name_order() {
+        let mut entries = vec![
+            dummy_entry("beta", 100, Some(30 * 24 * 60 * 60)),
+            dummy_entry("alpha", 100, Some(30 * 24 * 60 * 60)),
+        ];
+
+        sort_entries(&mut entries);
+
+        assert_eq!(entries[0].name, "alpha");
+        assert_eq!(entries[1].name, "beta");
+    }
+
+    #[test]
     fn derived_data_entries_are_default_cleanup_candidates_when_policy_allows() {
         let home = temp_home("defaults");
         write_file(
@@ -1238,6 +1480,36 @@ mod tests {
                 .map(|metadata| metadata.cleanup_kind),
             Some(CleanupRecommendationKind::SafeCleanupCandidate)
         );
+    }
+
+    #[test]
+    fn stale_bucket_thresholds_are_human_readable() {
+        assert_eq!(format_age_label(3 * 24 * 60 * 60), "3 days");
+        assert_eq!(format_age_label(21 * 24 * 60 * 60), "3 weeks");
+        assert_eq!(format_age_label(180 * 24 * 60 * 60), "6 months");
+    }
+
+    #[test]
+    fn scanner_can_use_deterministic_now_for_tests() {
+        let home = temp_home("deterministic-now");
+        write_file(
+            &home.join("Library/Developer/Xcode/DerivedData/AppA/Build/file1"),
+            10,
+        );
+        let now = SystemTime::now() + Duration::from_secs(20 * 24 * 60 * 60);
+
+        let scan = scan_for_home_with_tmp_root_and_now(&home, None, now);
+        let entry = scan
+            .categories
+            .iter()
+            .find(|category| category.name == "Derived Data")
+            .and_then(|category| category.entries.first())
+            .expect("derived data entry should exist");
+
+        assert!(matches!(
+            entry.age.stale_bucket,
+            StaleBucket::Stale | StaleBucket::Recent
+        ));
     }
 
     #[test]

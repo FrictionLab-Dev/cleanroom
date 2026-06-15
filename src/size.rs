@@ -1,4 +1,11 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::UNIX_EPOCH};
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PathMetrics {
+    pub size_bytes: u64,
+    pub file_count: u64,
+    pub last_modified_unix_seconds: Option<u64>,
+}
 
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -17,40 +24,60 @@ pub fn format_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit_index])
 }
 
-pub fn path_size_bytes(path: &Path, warnings: &mut Vec<String>) -> u64 {
+pub fn path_metrics(path: &Path, warnings: &mut Vec<String>) -> PathMetrics {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {
             warnings.push(format!("Could not inspect {}: {}", path.display(), error));
-            return 0;
+            return PathMetrics::default();
         }
     };
 
     if metadata.file_type().is_symlink() {
         warnings.push(format!("Skipped symlink {}", path.display()));
-        return 0;
+        return PathMetrics::default();
     }
 
+    let path_modified = modified_unix_seconds(path, &metadata, warnings);
+
     if metadata.is_file() {
-        return metadata.len();
+        return PathMetrics {
+            size_bytes: metadata.len(),
+            file_count: 1,
+            last_modified_unix_seconds: path_modified,
+        };
     }
 
     if !metadata.is_dir() {
-        return 0;
+        return PathMetrics::default();
     }
 
     let read_dir = match fs::read_dir(path) {
         Ok(read_dir) => read_dir,
         Err(error) => {
             warnings.push(format!("Could not read {}: {}", path.display(), error));
-            return 0;
+            return PathMetrics {
+                last_modified_unix_seconds: path_modified,
+                ..PathMetrics::default()
+            };
         }
     };
 
-    let mut total = 0_u64;
+    let mut total = PathMetrics {
+        last_modified_unix_seconds: path_modified,
+        ..PathMetrics::default()
+    };
     for child in read_dir {
         match child {
-            Ok(entry) => total += path_size_bytes(&entry.path(), warnings),
+            Ok(entry) => {
+                let child_metrics = path_metrics(&entry.path(), warnings);
+                total.size_bytes += child_metrics.size_bytes;
+                total.file_count += child_metrics.file_count;
+                total.last_modified_unix_seconds = latest_modified(
+                    total.last_modified_unix_seconds,
+                    child_metrics.last_modified_unix_seconds,
+                );
+            }
             Err(error) => warnings.push(format!(
                 "Could not read entry under {}: {}",
                 path.display(),
@@ -60,4 +87,36 @@ pub fn path_size_bytes(path: &Path, warnings: &mut Vec<String>) -> u64 {
     }
 
     total
+}
+
+fn modified_unix_seconds(
+    path: &Path,
+    metadata: &fs::Metadata,
+    warnings: &mut Vec<String>,
+) -> Option<u64> {
+    let modified = match metadata.modified() {
+        Ok(modified) => modified,
+        Err(error) => {
+            warnings.push(format!(
+                "Could not read modified time for {}: {}",
+                path.display(),
+                error
+            ));
+            return None;
+        }
+    };
+
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn latest_modified(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
 }

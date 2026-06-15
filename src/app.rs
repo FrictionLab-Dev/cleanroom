@@ -21,6 +21,7 @@ pub enum Screen {
     CategorySummary,
     EntryChecklist,
     PreviewCleanup,
+    HighCautionConfirmation,
     ConfirmCleanup,
     CleanupResult,
 }
@@ -41,7 +42,15 @@ pub struct App {
     pub xcode_scan: Option<ScannedSource>,
     pub cleanup_result: Option<CleanupExecutionResult>,
     pub cleanup_stats: Option<CleanupStats>,
+    pub high_caution_confirmation: Option<HighCautionConfirmationState>,
     pub warning: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HighCautionConfirmationState {
+    pub phrase: String,
+    pub categories: Vec<String>,
+    pub typed: String,
 }
 
 impl App {
@@ -56,6 +65,7 @@ impl App {
             xcode_scan: None,
             cleanup_result: None,
             cleanup_stats: None,
+            high_caution_confirmation: None,
             warning: None,
         }
     }
@@ -86,6 +96,7 @@ impl App {
             Screen::CategorySummary => self.enter_category(),
             Screen::EntryChecklist
             | Screen::PreviewCleanup
+            | Screen::HighCautionConfirmation
             | Screen::ConfirmCleanup
             | Screen::CleanupResult => {}
         }
@@ -100,6 +111,10 @@ impl App {
             Screen::EntryChecklist | Screen::PreviewCleanup | Screen::CleanupResult => {
                 self.screen = Screen::CategorySummary
             }
+            Screen::HighCautionConfirmation => {
+                self.high_caution_confirmation = None;
+                self.screen = Screen::PreviewCleanup;
+            }
             Screen::ConfirmCleanup => self.screen = Screen::PreviewCleanup,
         }
     }
@@ -109,6 +124,7 @@ impl App {
         self.warning = None;
         self.cleanup_result = None;
         self.cleanup_stats = None;
+        self.high_caution_confirmation = None;
         self.refresh_xcode_scan();
         self.screen = Screen::CategorySummary;
     }
@@ -119,6 +135,7 @@ impl App {
             self.warning = None;
             self.cleanup_result = None;
             self.cleanup_stats = None;
+            self.high_caution_confirmation = None;
             self.screen = Screen::PreviewCleanup;
         }
     }
@@ -144,7 +161,19 @@ impl App {
         };
         self.cleanup_result = None;
         self.cleanup_stats = None;
-        self.screen = Screen::ConfirmCleanup;
+        self.high_caution_confirmation =
+            plan.high_caution_phrase
+                .clone()
+                .map(|phrase| HighCautionConfirmationState {
+                    phrase,
+                    categories: plan.high_caution_categories.clone(),
+                    typed: String::new(),
+                });
+        self.screen = if self.high_caution_confirmation.is_some() {
+            Screen::HighCautionConfirmation
+        } else {
+            Screen::ConfirmCleanup
+        };
     }
 
     pub fn execute_cleanup(&mut self) {
@@ -176,6 +205,7 @@ impl App {
         };
         self.cleanup_result = Some(result);
         self.warning = None;
+        self.high_caution_confirmation = None;
         self.refresh_xcode_scan();
         self.screen = Screen::CleanupResult;
     }
@@ -213,12 +243,53 @@ impl App {
         self.mode == InteractionMode::Action
     }
 
+    pub fn append_high_caution_confirmation_char(&mut self, ch: char) {
+        let Some(state) = self.high_caution_confirmation.as_mut() else {
+            return;
+        };
+
+        if !matches!(self.screen, Screen::HighCautionConfirmation) {
+            return;
+        }
+
+        if ch.is_ascii_control() {
+            return;
+        }
+
+        state.typed.push(ch.to_ascii_uppercase());
+        self.warning = None;
+    }
+
+    pub fn backspace_high_caution_confirmation(&mut self) {
+        if let Some(state) = self.high_caution_confirmation.as_mut() {
+            state.typed.pop();
+        }
+    }
+
+    pub fn submit_high_caution_confirmation(&mut self) {
+        let Some(state) = self.high_caution_confirmation.as_ref() else {
+            return;
+        };
+
+        if state.typed.trim() == state.phrase {
+            self.warning = None;
+            self.screen = Screen::ConfirmCleanup;
+            return;
+        }
+
+        self.warning = Some(format!(
+            "Typed confirmation must exactly match {}",
+            state.phrase
+        ));
+    }
+
     pub fn current_screen_title(&self) -> &'static str {
         match self.screen {
             Screen::SourceList => "Source list",
             Screen::CategorySummary => "Xcode categories",
             Screen::EntryChecklist => "Entry checklist",
             Screen::PreviewCleanup => "Cleanup preview",
+            Screen::HighCautionConfirmation => "High-caution confirmation",
             Screen::ConfirmCleanup => "Confirm cleanup",
             Screen::CleanupResult => "Cleanup result",
         }
@@ -237,6 +308,7 @@ impl App {
                 .as_ref()
                 .map(|scan| format!("{} / preview only", source_label(scan.source_id)))
                 .unwrap_or_else(|| "Xcode / preview only".to_string()),
+            Screen::HighCautionConfirmation => "Xcode / high-caution confirmation".to_string(),
             Screen::ConfirmCleanup => "Xcode / move to Trash confirmation".to_string(),
             Screen::CleanupResult => "Xcode / cleanup result".to_string(),
         }
@@ -248,7 +320,9 @@ impl App {
         }
 
         let warnings = match self.screen {
-            Screen::PreviewCleanup | Screen::ConfirmCleanup => self.preview_plan().warnings,
+            Screen::PreviewCleanup | Screen::HighCautionConfirmation | Screen::ConfirmCleanup => {
+                self.preview_plan().warnings
+            }
             Screen::CleanupResult => self
                 .cleanup_result
                 .as_ref()
@@ -305,7 +379,10 @@ impl App {
     }
 
     pub fn entry_table_header(&self) -> String {
-        format!("{:<4}  {:<34} {:>10}", "Keep", "Entry", "Size")
+        format!(
+            "{:<4}  {:<24} {:<10} {:>10}",
+            "Keep", "Entry", "Age", "Size"
+        )
     }
 
     pub fn entry_rows(&self) -> Vec<String> {
@@ -319,9 +396,10 @@ impl App {
                         .iter()
                         .map(|entry| {
                             format!(
-                                "{:<4}  {:<34} {:>10}",
+                                "{:<4}  {:<24} {:<10} {:>10}",
                                 if entry.keep { "✓" } else { "" },
-                                truncate_text(&entry.name, 34),
+                                truncate_text(&entry.name, 24),
+                                truncate_text(&entry.age.age_label, 10),
                                 format_bytes(entry.size_bytes)
                             )
                         })
@@ -356,9 +434,11 @@ impl App {
 
         rows.extend(plan.preview_items.iter().map(|item| {
             format!(
-                "{} / {} - {} - {}",
+                "{} / {} - {} - {} files - {} - {}",
                 item.category_name,
                 item.entry_name,
+                item.age.age_label,
+                item.file_count,
                 format_bytes(item.size_bytes),
                 shorten_path(&item.path, 36)
             )
@@ -377,7 +457,27 @@ impl App {
             format!("Cleanup candidates: {}", plan.removal_count),
             format!("Selected files: {}", self.total_reclaimable_file_count()),
             "These items will be moved to Trash, not permanently deleted.".to_string(),
+            if plan.requires_high_caution_confirmation() {
+                "High-caution typed confirmation was required before this final step.".to_string()
+            } else {
+                "No high-caution typed confirmation is required for this plan.".to_string()
+            },
             "Press y to confirm or n / Esc to cancel.".to_string(),
+        ]
+    }
+
+    pub fn high_caution_confirmation_rows(&self) -> Vec<String> {
+        let Some(state) = &self.high_caution_confirmation else {
+            return vec!["No high-caution confirmation is required.".to_string()];
+        };
+
+        vec![
+            "High-caution cleanup needs a typed confirmation before the final Trash step."
+                .to_string(),
+            format!("Categories: {}", state.categories.join(", ")),
+            format!("Type exactly: {}", state.phrase),
+            format!("Current input: {}", state.typed),
+            "Press Enter after the phrase, or Esc to cancel.".to_string(),
         ]
     }
 
@@ -433,7 +533,10 @@ impl App {
             Screen::SourceList => Some(self.source_selected),
             Screen::CategorySummary => Some(self.category_selected),
             Screen::EntryChecklist => Some(self.entry_selected),
-            Screen::PreviewCleanup | Screen::ConfirmCleanup | Screen::CleanupResult => None,
+            Screen::PreviewCleanup
+            | Screen::HighCautionConfirmation
+            | Screen::ConfirmCleanup
+            | Screen::CleanupResult => None,
         }
     }
 
@@ -466,6 +569,10 @@ impl App {
             (Screen::PreviewCleanup, InteractionMode::Action) => {
                 ["action mode · c confirm cleanup · Esc cancel", ""]
             }
+            (Screen::HighCautionConfirmation, _) => [
+                "Type the phrase exactly · Enter continue · Backspace edit · Esc cancel · q quit",
+                "",
+            ],
             (Screen::ConfirmCleanup, _) => ["y move to Trash · n cancel · Esc cancel · q quit", ""],
             (Screen::CleanupResult, _) => ["Esc back · q quit", ""],
         }
@@ -490,6 +597,7 @@ impl App {
                 })
                 .unwrap_or_else(|| "Entry details".to_string()),
             Screen::PreviewCleanup => "Preview".to_string(),
+            Screen::HighCautionConfirmation => "Type Confirmation".to_string(),
             Screen::ConfirmCleanup => "Confirmation".to_string(),
             Screen::CleanupResult => "Result".to_string(),
         }
@@ -517,6 +625,7 @@ impl App {
                 lines.extend(self.preview_policy_lines());
                 lines
             }
+            Screen::HighCautionConfirmation => self.high_caution_detail_lines(),
             Screen::ConfirmCleanup => {
                 let plan = self.preview_plan();
                 let mut lines = vec![
@@ -543,6 +652,11 @@ impl App {
         match self.screen {
             Screen::SourceList => "Available cleanup sources".to_string(),
             Screen::CategorySummary | Screen::PreviewCleanup | Screen::ConfirmCleanup => self
+                .xcode_scan
+                .as_ref()
+                .map(|scan| shorten_path(&scan.root_hint, 54))
+                .unwrap_or_else(|| "No scan yet".to_string()),
+            Screen::HighCautionConfirmation => self
                 .xcode_scan
                 .as_ref()
                 .map(|scan| shorten_path(&scan.root_hint, 54))
@@ -633,6 +747,7 @@ impl App {
             Screen::PreviewCleanup | Screen::ConfirmCleanup | Screen::CleanupResult => {
                 &mut self.category_selected
             }
+            Screen::HighCautionConfirmation => &mut self.category_selected,
         }
     }
 
@@ -648,7 +763,10 @@ impl App {
                 .selected_category()
                 .map(|category| category.entries.len().max(1))
                 .unwrap_or(1),
-            Screen::PreviewCleanup | Screen::ConfirmCleanup | Screen::CleanupResult => 0,
+            Screen::PreviewCleanup
+            | Screen::HighCautionConfirmation
+            | Screen::ConfirmCleanup
+            | Screen::CleanupResult => 0,
         }
     }
 
@@ -771,6 +889,15 @@ impl App {
                     format!("Selected files: {}", category.reclaimable_file_count()),
                     format!("Kept entries: {}", category.keep_count()),
                     format!("Cleanup candidates: {}", category.remove_count()),
+                    format!(
+                        "Oldest entry: {}",
+                        category.oldest_entry_age_label().unwrap_or("Unknown")
+                    ),
+                    format!(
+                        "Stale entries: {} stale / {} very stale",
+                        category.stale_entry_count(),
+                        category.very_stale_entry_count()
+                    ),
                 ];
 
                 if let Some(metadata) = &category.metadata {
@@ -855,6 +982,9 @@ impl App {
             format!("Category: {}", category.name),
             format!("Size: {}", format_bytes(entry.size_bytes)),
             format!("Files: {}", entry.file_count),
+            format!("Age: {}", entry.age.age_label),
+            format!("Last modified: {}", entry.age.last_modified_label),
+            format!("Staleness: {}", entry.age.stale_bucket.label()),
             format!("Safety: {}", safety_label(entry.metadata.safety)),
         ];
 
@@ -943,7 +1073,27 @@ impl App {
             lines.push(format!("Keep by default: {}", keep_by_default.join(", ")));
         }
 
+        let plan = self.preview_plan();
+        if let Some(phrase) = &plan.high_caution_phrase {
+            lines.push(format!("Typed confirmation required: {}", phrase));
+        }
+
         lines
+    }
+
+    fn high_caution_detail_lines(&self) -> Vec<String> {
+        let Some(state) = &self.high_caution_confirmation else {
+            return vec!["No high-caution confirmation is required.".to_string()];
+        };
+
+        vec![
+            "High-caution cleanup was selected.".to_string(),
+            format!("Categories: {}", state.categories.join(", ")),
+            "These categories are keep-by-default and need extra friction before Trash move."
+                .to_string(),
+            format!("Type exactly: {}", state.phrase),
+            format!("Current input: {}", state.typed),
+        ]
     }
 }
 
@@ -1023,4 +1173,194 @@ fn category_safety_badge(safety: CategorySafetyLevel) -> &'static str {
 
 fn cleanup_kind_label(kind: CleanupRecommendationKind) -> &'static str {
     kind.label()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::{
+        profile::{CategorySafetyLevel, CleanupRecommendationKind, SafetyLevel},
+        sources::{
+            CleanCategory, CleanCategoryId, CleanCategoryMetadata, CleanEntry, CleanEntryMetadata,
+            CleanSourceId, EntryAge, ScannedSource, StaleBucket,
+        },
+    };
+
+    use super::{App, Screen};
+
+    fn make_entry(name: &str, keep: bool) -> CleanEntry {
+        CleanEntry {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/tmp/{name}")),
+            allowed_root: PathBuf::from("/tmp"),
+            size_bytes: 10,
+            file_count: 1,
+            age: EntryAge {
+                last_modified_unix_seconds: Some(1),
+                last_modified_label: "1970-01-01".to_string(),
+                age_seconds: Some(60 * 60),
+                age_label: "Today".to_string(),
+                stale_bucket: StaleBucket::Fresh,
+            },
+            keep,
+            metadata: CleanEntryMetadata {
+                matched_rule: None,
+                description: "Generated artifact.".to_string(),
+                safety: SafetyLevel::Recommended,
+                recommendation: "Review.".to_string(),
+                impact: None,
+            },
+        }
+    }
+
+    fn make_category(
+        id: CleanCategoryId,
+        name: &str,
+        safety: CategorySafetyLevel,
+        cleanup_kind: CleanupRecommendationKind,
+        default_cleanup: bool,
+        keep: bool,
+    ) -> CleanCategory {
+        CleanCategory {
+            id,
+            name: name.to_string(),
+            stats_key: Some(format!("xcode.{name}")),
+            path: PathBuf::from("/tmp"),
+            roots: vec![PathBuf::from("/tmp")],
+            exists: true,
+            note: None,
+            warnings: Vec::new(),
+            entries: vec![make_entry(name, keep)],
+            total_size_bytes: 10,
+            total_file_count: 1,
+            metadata: Some(CleanCategoryMetadata {
+                description: "Category".to_string(),
+                safety,
+                default_cleanup,
+                cleanup_kind,
+                reversible: true,
+                move_to_trash: true,
+                caution: None,
+                recommendation: "Review".to_string(),
+                impact: "Impact".to_string(),
+            }),
+        }
+    }
+
+    fn app_with_scan(categories: Vec<CleanCategory>) -> App {
+        let mut app = App::new();
+        app.xcode_scan = Some(ScannedSource {
+            source_id: CleanSourceId::Xcode,
+            source_name: "Xcode",
+            profile_key: "xcode".to_string(),
+            root_hint: PathBuf::from("/tmp"),
+            categories,
+            warnings: Vec::new(),
+        });
+        app
+    }
+
+    #[test]
+    fn archives_cleanup_requires_high_caution_confirmation() {
+        let mut app = app_with_scan(vec![make_category(
+            CleanCategoryId::Archives,
+            "Archives",
+            CategorySafetyLevel::HighCaution,
+            CleanupRecommendationKind::KeepByDefault,
+            false,
+            false,
+        )]);
+
+        app.show_confirmation();
+
+        assert_eq!(app.screen, Screen::HighCautionConfirmation);
+        assert_eq!(
+            app.high_caution_confirmation
+                .as_ref()
+                .map(|state| state.phrase.as_str()),
+            Some("CLEAN ARCHIVES")
+        );
+    }
+
+    #[test]
+    fn device_support_cleanup_requires_high_caution_confirmation() {
+        let mut app = app_with_scan(vec![make_category(
+            CleanCategoryId::DeviceSupport,
+            "Device Support",
+            CategorySafetyLevel::HighCaution,
+            CleanupRecommendationKind::KeepByDefault,
+            false,
+            false,
+        )]);
+
+        app.show_confirmation();
+
+        assert_eq!(app.screen, Screen::HighCautionConfirmation);
+        assert_eq!(
+            app.high_caution_confirmation
+                .as_ref()
+                .map(|state| state.phrase.as_str()),
+            Some("CLEAN DEVICE SUPPORT")
+        );
+    }
+
+    #[test]
+    fn high_confidence_cleanup_does_not_require_high_caution_confirmation() {
+        let mut app = app_with_scan(vec![make_category(
+            CleanCategoryId::DerivedData,
+            "Derived Data",
+            CategorySafetyLevel::HighConfidence,
+            CleanupRecommendationKind::SafeCleanupCandidate,
+            true,
+            false,
+        )]);
+
+        app.show_confirmation();
+
+        assert_eq!(app.screen, Screen::ConfirmCleanup);
+        assert!(app.high_caution_confirmation.is_none());
+    }
+
+    #[test]
+    fn typed_high_caution_phrase_advances_to_final_confirmation() {
+        let mut app = app_with_scan(vec![make_category(
+            CleanCategoryId::Archives,
+            "Archives",
+            CategorySafetyLevel::HighCaution,
+            CleanupRecommendationKind::KeepByDefault,
+            false,
+            false,
+        )]);
+        app.show_confirmation();
+
+        for ch in "CLEAN ARCHIVES".chars() {
+            app.append_high_caution_confirmation_char(ch);
+        }
+        app.submit_high_caution_confirmation();
+
+        assert_eq!(app.screen, Screen::ConfirmCleanup);
+        assert!(app.warning.is_none());
+    }
+
+    #[test]
+    fn incorrect_high_caution_phrase_keeps_user_on_typed_confirmation() {
+        let mut app = app_with_scan(vec![make_category(
+            CleanCategoryId::Archives,
+            "Archives",
+            CategorySafetyLevel::HighCaution,
+            CleanupRecommendationKind::KeepByDefault,
+            false,
+            false,
+        )]);
+        app.show_confirmation();
+
+        for ch in "WRONG".chars() {
+            app.append_high_caution_confirmation_char(ch);
+        }
+        app.submit_high_caution_confirmation();
+
+        assert_eq!(app.screen, Screen::HighCautionConfirmation);
+        assert!(app.warning.is_some());
+    }
 }

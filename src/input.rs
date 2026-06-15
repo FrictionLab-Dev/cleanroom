@@ -16,6 +16,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         Screen::CategorySummary => handle_category_summary(app, key),
         Screen::EntryChecklist => handle_entry_checklist(app, key),
         Screen::PreviewCleanup => handle_preview_cleanup(app, key),
+        Screen::HighCautionConfirmation => handle_high_caution_confirmation(app, key),
         Screen::ConfirmCleanup => handle_confirm_cleanup(app, key),
         Screen::CleanupResult => handle_cleanup_result(app, key),
     }
@@ -85,6 +86,19 @@ fn handle_confirm_cleanup(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
+fn handle_high_caution_confirmation(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Enter => app.submit_high_caution_confirmation(),
+        KeyCode::Backspace => app.backspace_high_caution_confirmation(),
+        KeyCode::Esc => app.back(),
+        KeyCode::Char('q') => return true,
+        KeyCode::Char(ch) => app.append_high_caution_confirmation_char(ch),
+        _ => {}
+    }
+
+    false
+}
+
 fn handle_cleanup_result(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => app.back(),
@@ -123,7 +137,7 @@ fn handle_action_mode(app: &mut App, key: KeyEvent) -> bool {
             KeyCode::Char('q') => return true,
             _ => {}
         },
-        Screen::ConfirmCleanup | Screen::CleanupResult => {}
+        Screen::HighCautionConfirmation | Screen::ConfirmCleanup | Screen::CleanupResult => {}
     }
 
     false

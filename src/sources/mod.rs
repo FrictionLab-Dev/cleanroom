@@ -38,6 +38,7 @@ pub struct CleanEntry {
     pub allowed_root: PathBuf,
     pub size_bytes: u64,
     pub file_count: u64,
+    pub age: EntryAge,
     pub keep: bool,
     pub metadata: CleanEntryMetadata,
 }
@@ -104,6 +105,74 @@ impl CleanCategory {
     pub fn remove_count(&self) -> usize {
         self.entries.len().saturating_sub(self.keep_count())
     }
+
+    pub fn oldest_entry_age_label(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.age.age_seconds.is_some())
+            .max_by_key(|entry| entry.age.age_seconds.unwrap_or(0))
+            .map(|entry| entry.age.age_label.as_str())
+    }
+
+    pub fn stale_entry_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.age.stale_bucket,
+                    StaleBucket::Stale | StaleBucket::VeryStale
+                )
+            })
+            .count()
+    }
+
+    pub fn very_stale_entry_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.age.stale_bucket == StaleBucket::VeryStale)
+            .count()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
+pub enum StaleBucket {
+    #[default]
+    Unknown,
+    Fresh,
+    Recent,
+    Stale,
+    VeryStale,
+}
+
+impl StaleBucket {
+    pub fn label(self) -> &'static str {
+        match self {
+            StaleBucket::Unknown => "Unknown",
+            StaleBucket::Fresh => "Fresh",
+            StaleBucket::Recent => "Recent",
+            StaleBucket::Stale => "Stale",
+            StaleBucket::VeryStale => "Very stale",
+        }
+    }
+
+    pub fn sort_rank(self) -> u8 {
+        match self {
+            StaleBucket::VeryStale => 4,
+            StaleBucket::Stale => 3,
+            StaleBucket::Recent => 2,
+            StaleBucket::Fresh => 1,
+            StaleBucket::Unknown => 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EntryAge {
+    pub last_modified_unix_seconds: Option<u64>,
+    pub last_modified_label: String,
+    pub age_seconds: Option<u64>,
+    pub age_label: String,
+    pub stale_bucket: StaleBucket,
 }
 
 #[derive(Clone, Debug)]
@@ -123,15 +192,21 @@ pub struct CleanupPlan {
     pub total_reclaimable_bytes: u64,
     pub removal_count: usize,
     pub preview_items: Vec<CleanupPreviewItem>,
+    pub high_caution_categories: Vec<String>,
+    pub high_caution_phrase: Option<String>,
     pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
 pub struct CleanupPreviewItem {
+    pub category_id: CleanCategoryId,
     pub category_name: String,
     pub category_key: Option<String>,
     pub entry_name: String,
     pub size_bytes: u64,
+    pub file_count: u64,
+    pub age: EntryAge,
+    pub high_caution: bool,
     pub path: PathBuf,
     pub allowed_root: PathBuf,
 }
@@ -253,6 +328,12 @@ impl CleanupExecutionResult {
                 self.failed_items.push(record);
             }
         }
+    }
+}
+
+impl CleanupPlan {
+    pub fn requires_high_caution_confirmation(&self) -> bool {
+        self.high_caution_phrase.is_some()
     }
 }
 
